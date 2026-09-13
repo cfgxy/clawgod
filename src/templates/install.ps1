@@ -73,7 +73,7 @@ if ($Uninstall) {
         Write-OK "Removed clawgod alias"
     }
 
-    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","asset-guard.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
         $p = Join-Path $ClawDir $f
         if (Test-Path $p) { Remove-Item -Recurse -Force $p }
     }
@@ -453,6 +453,13 @@ Write-OK "Wrapper created (cli.cjs)"
 {{CLAWGOD:runtime-helpers.cjs}}
 '@ | Set-Content (Join-Path $ClawDir "runtime-helpers.cjs") -Encoding UTF8
 Write-OK "Classifier helper created (runtime-helpers.cjs)"
+
+# --- Write asset execution guard ---------------------------------------
+
+@'
+{{CLAWGOD:asset-guard.cjs}}
+'@ | Set-Content (Join-Path $ClawDir "asset-guard.cjs") -Encoding UTF8
+Write-OK "Asset execution guard created (asset-guard.cjs)"
 
 # --- Write universal patcher ------------------------------------------
 # (Same Node.js patcher as bash version -- inline to avoid extra download)

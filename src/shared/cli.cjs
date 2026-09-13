@@ -243,4 +243,23 @@ require('./feature-gates.cjs');
 // the patched bundle reaches helpers through globalThis only.
 require('./runtime-helpers.cjs');
 
+// Asset-execution guard (see asset-guard.cjs): in graph installs the bundled
+// skill-asset scripts (runner-scaffold / build-report-lite templates) are
+// real files, and claude ≥2.1.270 mis-resolves one as the CLI entry on some
+// Skill-tool paths — executing the template exits 2 and kills the session.
+// Graph installs only: the legacy single-bundle keeps the assets inside
+// cli.original.cjs where they cannot be spawned. Must wrap child_process
+// before the patched cli loads so every spawn it issues is covered.
+try {
+  const _assetGuardBunfsDir = join(clawgodDir, 'bunfs');
+  if (existsSync(_assetGuardBunfsDir)) {
+    const { installAssetSpawnGuard } = require('./asset-guard.cjs');
+    installAssetSpawnGuard(require('child_process'), {
+      bunfsDir: _assetGuardBunfsDir,
+      logFile: join(clawgodDir, 'asset-spawn-guard.log'),
+      cliExecPath: process.env.CLAUDE_CODE_EXECPATH || '',
+    });
+  }
+} catch { /* guard is best-effort — never block the CLI on it */ }
+
 require('./cli.original.cjs');

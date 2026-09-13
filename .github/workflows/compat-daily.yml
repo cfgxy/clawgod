@@ -49,6 +49,9 @@ jobs:
       - name: Run patch semantic tests
         run: node src/shared/patch.test.mjs
 
+      - name: Run asset-guard tests
+        run: node src/shared/asset-guard.test.mjs
+
       - name: Check embedded JavaScript syntax
         shell: bash
         run: |
