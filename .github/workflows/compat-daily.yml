@@ -55,6 +55,10 @@ jobs:
 
       - name: Run skill-entry-guard tests
         run: node src/shared/skill-entry-guard.test.mjs
+
+      - name: Run installer wiring regression tests
+        run: node src/shared/installer-wiring.test.mjs
+
       - name: Test inactive issue policy
         run: node .github/scripts/close-inactive-issues.test.cjs
 
