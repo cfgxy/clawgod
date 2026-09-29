@@ -43,6 +43,7 @@ NC='\033[0m'
 
 info()  { echo -e "  ${GREEN}✓${NC} $1"; }
 warn()  { echo -e "  ${RED}✗${NC} $1"; }
+err()   { echo -e "  ${RED}✗${NC} $1" >&2; }
 dim()   { echo -e "  ${DIM}$1${NC}"; }
 
 echo ""
@@ -164,6 +165,17 @@ info "ripgrep: $(rg --version | head -1)"
 
 # ─── Handle --no-upgrade (skip download, re-patch only) ──────────────
 mkdir -p "$CLAWGOD_DIR" "$BIN_DIR"
+
+# ─── Write skill-template entry guard ──────────────────
+# Must land on disk BEFORE post-process.mjs runs: post-process imports it at
+# module top to heal fresh graph installs, and cli.cjs requires it on every
+# launch. Written unconditionally so both the fresh-install and the
+# --no-upgrade paths refresh it.
+
+cat > "$CLAWGOD_DIR/skill-entry-guard.cjs" << 'CFG_EOF'
+{{CLAWGOD:skill-entry-guard.cjs}}
+CFG_EOF
+info "Skill-template entry guard created (skill-entry-guard.cjs)"
 
 if [ "$NO_UPGRADE" = "1" ]; then
   if [ ! -f "$CLAWGOD_DIR/cli.original.cjs" ]; then
@@ -360,13 +372,6 @@ cat > "$CLAWGOD_DIR/runtime-helpers.cjs" << 'CFG_EOF'
 CFG_EOF
 info "Classifier runtime helpers created (runtime-helpers.cjs)"
 
-# ─── Write skill-template entry guard ──────────────────
-
-cat > "$CLAWGOD_DIR/skill-entry-guard.cjs" << 'CFG_EOF'
-{{CLAWGOD:skill-entry-guard.cjs}}
-CFG_EOF
-info "Skill-template entry guard created (skill-entry-guard.cjs)"
-
 # ─── Write Bun.ant runtime shim ────────────────────────
 # Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
 # Anthropic-private Bun API that stock Bun does not ship. cli.cjs loads this
@@ -506,27 +511,45 @@ fi
 # first invocation.
 
 dim "Verifying Bun can load patched cli.original.cjs ..."
-sanity_out=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1 || true)
-if echo "$sanity_out" | grep -q "Expected CommonJS module to have a function wrapper"; then
+# Fail-closed: the probe must exit 0 AND produce output. A swallowed failure
+# here shipped a launcher that dies on first use while the installer reported
+# success (the "unknown argument: -p" class of false passes).
+set +e
+sanity_out=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1)
+sanity_status=$?
+set -e
+if [ "$sanity_status" -ne 0 ] || [ -z "$sanity_out" ]; then
   echo ""
-  warn "Bun $($BUN_BIN --version) cannot load Anthropic's cli.original.cjs."
-  warn ""
-  warn "  Anthropic builds with Bun's canary channel (currently ~1.3.14), while"
-  warn "  bun.sh's main download is on stable (currently 1.3.13). The canary build"
-  warn "  is NOT visible on bun.sh's download page — it lives on GitHub Releases"
-  warn "  and is reachable only via 'bun upgrade --canary'."
-  warn ""
-  warn "  If your bun is from bun.sh:"
-  warn "    bun upgrade --canary"
-  warn ""
-  warn "  If your bun is from a package manager (brew/apt/scoop) where the binary"
-  warn "  is behind a shim and refuses to self-replace ('bun upgrade' silently"
-  warn "  hangs or no-ops):"
-  warn "    <pkg-manager> uninstall bun"
-  warn "    curl -fsSL https://bun.sh/install | bash"
-  warn "    bun upgrade --canary"
-  warn ""
-  warn "  Then re-run install.sh — this sanity check will pass."
+  if echo "$sanity_out" | grep -q "Expected CommonJS module to have a function wrapper"; then
+    warn "Bun $($BUN_BIN --version) cannot load Anthropic's cli.original.cjs."
+    warn ""
+    warn "  Anthropic builds with Bun's canary channel (currently ~1.3.14), while"
+    warn "  bun.sh's main download is on stable (currently 1.3.13). The canary build"
+    warn "  is NOT visible on bun.sh's download page — it lives on GitHub Releases"
+    warn "  and is reachable only via 'bun upgrade --canary'."
+    warn ""
+    warn "  If your bun is from bun.sh:"
+    warn "    bun upgrade --canary"
+    warn ""
+    warn "  If your bun is from a package manager (brew/apt/scoop) where the binary"
+    warn "  is behind a shim and refuses to self-replace ('bun upgrade' silently"
+    warn "  hangs or no-ops):"
+    warn "    <pkg-manager> uninstall bun"
+    warn "    curl -fsSL https://bun.sh/install | bash"
+    warn "    bun upgrade --canary"
+    warn ""
+    warn "  Then re-run install.sh — this sanity check will pass."
+  else
+    warn "Post-install verification FAILED: 'bun cli.cjs --version' exited with status ${sanity_status:-?} or produced no version output."
+    warn "  The installed launcher would fail the same way on first use, so the"
+    warn "  install is aborted here instead of being reported as a success."
+    warn "  Diagnostics (tail of the probe output):"
+    if [ -n "$sanity_out" ]; then
+      echo "$sanity_out" | tail -15 | sed 's/^/    /'
+    fi
+    warn ""
+    warn "  Re-run this installer; if the failure persists, report the output above."
+  fi
   exit 1
 fi
 info "Bun loads cli.original.cjs"

@@ -217,6 +217,19 @@ catch {
     exit 1
 }
 
+# --- Write skill-template entry guard ----------------------------------
+# Must land on disk BEFORE post-process.mjs runs: post-process imports it at
+# module top to heal fresh graph installs, and cli.cjs requires it on every
+# launch. Written unconditionally so both the fresh-install and the
+# -NoUpgrade paths refresh it.
+
+New-Item -ItemType Directory -Force -Path $ClawDir | Out-Null
+
+@'
+{{CLAWGOD:skill-entry-guard.cjs}}
+'@ | Set-Content (Join-Path $ClawDir "skill-entry-guard.cjs") -Encoding UTF8
+Write-OK "Skill-template entry guard created (skill-entry-guard.cjs)"
+
 # --- Handle -NoUpgrade (skip download, re-patch only) -----------------
 if ($NoUpgrade) {
     New-Item -ItemType Directory -Force -Path $ClawDir | Out-Null
@@ -454,13 +467,6 @@ Write-OK "Wrapper created (cli.cjs)"
 {{CLAWGOD:runtime-helpers.cjs}}
 '@ | Set-Content (Join-Path $ClawDir "runtime-helpers.cjs") -Encoding UTF8
 Write-OK "Classifier helper created (runtime-helpers.cjs)"
-
-# --- Write skill-template entry guard ----------------------------------
-
-@'
-{{CLAWGOD:skill-entry-guard.cjs}}
-'@ | Set-Content (Join-Path $ClawDir "skill-entry-guard.cjs") -Encoding UTF8
-Write-OK "Skill-template entry guard created (skill-entry-guard.cjs)"
 
 # --- Write Bun.ant runtime shim ---------------------------------------
 # Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
