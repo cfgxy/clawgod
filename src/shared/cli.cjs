@@ -245,24 +245,48 @@ require('./feature-gates.cjs');
 // the patched bundle reaches helpers through globalThis only.
 require('./runtime-helpers.cjs');
 
-// Asset-execution guard (see asset-guard.cjs): in graph installs the bundled
-// skill-asset scripts (runner-scaffold / build-report-lite templates) are
-// real files, and claude ≥2.1.270 mis-resolves one as the CLI entry on some
-// Skill-tool paths — executing the template exits 2 and kills the session.
-// Graph installs only: the legacy single-bundle keeps the assets inside
-// cli.original.cjs where they cannot be spawned. Must wrap child_process
-// before the patched cli loads so every spawn it issues is covered.
+// Skill-template entry guard (see skill-entry-guard.cjs): in graph installs
+// the bundled skill templates (runner-scaffold / build-report-lite) are
+// extracted to real files under bunfs/, and claude's skill-file manifest
+// chunk evaluates them IN-PROCESS via import.meta.require() when a session
+// touches the skill table. An unguarded template then parses the host CLI's
+// argv and exits 2 on headless `-p` flags, killing the session before it
+// starts (the "unknown argument: -p" crash; intermittent because the
+// manifest chunk loads lazily). Heal the known templates idempotently
+// (.clawgod-orig backup + skill-entry-guard.log), then fail fast with an
+// explicit launcher error if any bunfs/*.mjs still carries unguarded
+// top-level entry code. Graph installs only: the legacy single-bundle keeps
+// the assets inside cli.original.cjs where they cannot be required.
 try {
-  const _assetGuardBunfsDir = join(clawgodDir, 'bunfs');
-  if (existsSync(_assetGuardBunfsDir)) {
-    const { installAssetSpawnGuard } = require('./asset-guard.cjs');
-    installAssetSpawnGuard(require('child_process'), {
-      bunfsDir: _assetGuardBunfsDir,
-      logFile: join(clawgodDir, 'asset-spawn-guard.log'),
-      cliExecPath: process.env.CLAUDE_CODE_EXECPATH || '',
-    });
+  const _segBunfsDir = join(clawgodDir, 'bunfs');
+  if (existsSync(_segBunfsDir)) {
+    const _seg = require('./skill-entry-guard.cjs');
+    const _segLog = join(clawgodDir, 'skill-entry-guard.log');
+    const _segReport = _seg.healSkillTemplates(_segBunfsDir, { logFile: _segLog });
+    for (const _u of _segReport.unmatched) {
+      process.stderr.write('[clawgod] skill-entry-guard: could not guard ' + _u.file + ' (' + _u.reason + ')\n');
+    }
+    const _segHits = _seg.scanSkillTemplateHazards(_segBunfsDir);
+    if (_segHits.length > 0) {
+      const _out = ['[clawgod] FATAL: unguarded skill template(s) in graph install.',
+        "[clawgod] Their top-level code runs in-process when claude's skill manifest",
+        '[clawgod] requires them at startup and can exit the whole CLI (the',
+        '[clawgod] "unknown argument: -p" startup crash):'];
+      for (const _h of _segHits) {
+        _out.push('[clawgod]   ' + _h.file + ' (line ' + _h.line + ', ' + _h.form + ')');
+      }
+      _out.push('[clawgod] Fix: re-run the clawgod installer to regenerate guarded templates, or');
+      _out.push("[clawgod] hand-wrap the file's top-level entry in `if (import.meta.main) { ... }`.");
+      process.stderr.write(_out.join('\n') + '\n');
+      try { _seg.appendGuardLog(_segLog, 'fatal', _segHits.map((_h) => _h.file + ':' + _h.line).join(', ')); } catch {}
+      process.exit(1);
+    }
   }
-} catch { /* guard is best-effort — never block the CLI on it */ }
+} catch (_segErr) {
+  // best-effort: a defect here must never brick the CLI - warn loudly instead
+  process.stderr.write('[clawgod] skill-entry-guard skipped: ' + ((_segErr && _segErr.message) || _segErr) + '\n');
+}
+
 // Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
 // Anthropic-private Bun API that stock Bun does not ship. Without it the
 // renderer throws before the first frame and the TUI looks hung, so the shim

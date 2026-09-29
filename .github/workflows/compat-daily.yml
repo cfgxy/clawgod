@@ -53,8 +53,8 @@ jobs:
       - name: Run patch semantic tests
         run: node src/shared/patch.test.mjs
 
-      - name: Run asset-guard tests
-        run: node src/shared/asset-guard.test.mjs
+      - name: Run skill-entry-guard tests
+        run: node src/shared/skill-entry-guard.test.mjs
       - name: Test inactive issue policy
         run: node .github/scripts/close-inactive-issues.test.cjs
 

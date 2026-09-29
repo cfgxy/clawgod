@@ -73,8 +73,8 @@ if ($Uninstall) {
         Write-OK "Removed clawgod alias"
     }
 
-    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","asset-guard.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
-    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","bun-ant-shim.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","skill-entry-guard.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","skill-entry-guard.cjs","bun-ant-shim.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
         $p = Join-Path $ClawDir $f
         if (Test-Path $p) { Remove-Item -Recurse -Force $p }
     }
@@ -455,12 +455,13 @@ Write-OK "Wrapper created (cli.cjs)"
 '@ | Set-Content (Join-Path $ClawDir "runtime-helpers.cjs") -Encoding UTF8
 Write-OK "Classifier helper created (runtime-helpers.cjs)"
 
-# --- Write asset execution guard ---------------------------------------
+# --- Write skill-template entry guard ----------------------------------
 
 @'
-{{CLAWGOD:asset-guard.cjs}}
-'@ | Set-Content (Join-Path $ClawDir "asset-guard.cjs") -Encoding UTF8
-Write-OK "Asset execution guard created (asset-guard.cjs)"
+{{CLAWGOD:skill-entry-guard.cjs}}
+'@ | Set-Content (Join-Path $ClawDir "skill-entry-guard.cjs") -Encoding UTF8
+Write-OK "Skill-template entry guard created (skill-entry-guard.cjs)"
+
 # --- Write Bun.ant runtime shim ---------------------------------------
 # Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
 # Anthropic-private Bun API that stock Bun does not ship. cli.cjs loads this
