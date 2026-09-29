@@ -74,6 +74,7 @@ if ($Uninstall) {
     }
 
     foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","asset-guard.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","bun-ant-shim.cjs","clawgod-import.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
         $p = Join-Path $ClawDir $f
         if (Test-Path $p) { Remove-Item -Recurse -Force $p }
     }
@@ -1109,7 +1110,7 @@ function stripCacheControl(obj) {
   for (var key in obj) { if (key === 'cache_control') continue; out[key] = stripCacheControl(obj[key]); }
   return out;
 }
-function translateRequest(body) {
+function translateRequest(body, configuredEffort) {
   var cleaned = stripCacheControl(body);
   var systemMsgs = translateSystem(cleaned.system);
   var userMsgs = translateMessages(cleaned.messages || []);
@@ -1118,6 +1119,13 @@ function translateRequest(body) {
   if (cleaned.temperature !== undefined) openaiBody.temperature = cleaned.temperature;
   if (cleaned.top_p !== undefined) openaiBody.top_p = cleaned.top_p;
   if (cleaned.stop_sequences) openaiBody.stop = cleaned.stop_sequences;
+  // Claude can omit output_config for unknown model aliases. Keep an explicit
+  // launcher setting authoritative, matching CLAUDE_CODE_EFFORT_LEVEL priority.
+  var effort = configuredEffort || (cleaned.output_config && cleaned.output_config.effort);
+  if (effort && effort !== 'auto') {
+    // Chat Completions calls the highest effort xhigh, not Claude's max.
+    openaiBody.reasoning_effort = effort === 'max' ? 'xhigh' : effort;
+  }
   var tools = translateTools(cleaned.tools);
   if (tools) openaiBody.tools = tools;
   if (cleaned.stream) openaiBody.stream_options = { include_usage: true };
@@ -1216,7 +1224,7 @@ function startProxy(config) {
       var requestModel = body.model || config.model || '';
       var isStream = !!body.stream;
       var openaiBody;
-      try { openaiBody = translateRequest(body); } catch (e) {
+      try { openaiBody = translateRequest(body, config.effort); } catch (e) {
         return new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Translation error: ' + e.message } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
       }
       var upstreamResp;
@@ -1412,6 +1420,12 @@ const CLAWGOD_FEATURES_META = {
   ]
 };
 
+// Features realized by the wrapper itself rather than by a baked patch id:
+// they read the same patches.json / CLAWGOD_FEATURE_* inputs, but their
+// consumer is cli.cjs (or a module it loads) instead of a runtime gate in
+// cli.original.cjs. Their gate lands in the same __clawgodPatches table.
+var CLAWGOD_RUNTIME_FEATURES = ['bun-ant-shim'];
+
 var clawgodDir = require('path').join(require('os').homedir(), '.clawgod');
 
 var _cfg = {};
@@ -1423,10 +1437,11 @@ for (var _name in process.env) {
   _cfg[_name.slice('CLAWGOD_FEATURE_'.length).toLowerCase().replace(/_/g, '-')] = _val === 'true';
 }
 
-// META keys are patch ids; a feature id is "known" when some patch lists it.
+// META keys are patch ids; a feature id is "known" when some patch lists it
+// or when the wrapper owns it (CLAWGOD_RUNTIME_FEATURES).
 // Unknown keys are residue (renamed/removed features).
 for (var _k in _cfg) {
-  var _known = false;
+  var _known = CLAWGOD_RUNTIME_FEATURES.indexOf(_k) >= 0;
   for (var _f in CLAWGOD_FEATURES_META) {
     if (CLAWGOD_FEATURES_META[_f].indexOf(_k) >= 0) { _known = true; break; }
   }
@@ -1441,6 +1456,9 @@ for (var _pid in CLAWGOD_FEATURES_META) {
     if (_cfg[_feats[_j]] !== false) { _on = true; break; }
   }
   _gate[_pid] = _on;
+}
+for (var _rfi = 0; _rfi < CLAWGOD_RUNTIME_FEATURES.length; _rfi++) {
+  _gate[CLAWGOD_RUNTIME_FEATURES[_rfi]] = _cfg[CLAWGOD_RUNTIME_FEATURES[_rfi]] !== false;
 }
 globalThis.__clawgodPatches = _gate;
 '@ | Set-Content (Join-Path $ClawDir "feature-gates.cjs") -Encoding UTF8
@@ -1489,6 +1507,7 @@ const defaultConfig = {
   baseURL: 'https://api.anthropic.com',
   model: '',
   smallModel: '',
+  effort: '',
   timeoutMs: 3000000,
 };
 
@@ -1520,8 +1539,9 @@ if (_proxyTypes[config.type]) {
       apiKey: _proxyKey,
       baseURL: config.baseURL || (config.type === 'grok' ? 'https://api.x.ai/v1' : ''),
       model: config.model || '',
+      effort: process.env.CLAUDE_CODE_EFFORT_LEVEL ?? config.effort,
     });
-    process.env.ANTHROPIC_API_KEY = 'proxy-passthrough';
+    delete process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_BASE_URL = 'http://127.0.0.1:' + _proxy.port;
     process.env.ANTHROPIC_AUTH_TOKEN = 'proxy-passthrough';
     if (config.model) process.env.ANTHROPIC_MODEL = config.model;
@@ -1530,7 +1550,7 @@ if (_proxyTypes[config.type]) {
     process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS ??= '1';
     process.on('exit', function () { try { _proxy.stop(); } catch {} });
     process.stderr.write('[clawgod] OpenAI-compat proxy on port ' + _proxy.port + ' (type: ' + config.type + ')\n');
-    config = { ...defaultConfig };  // prevent fallthrough to apiKey/baseURL injection below
+    config = { ...config, apiKey: '', baseURL: '', model: '', smallModel: '' };  // prevent fallthrough to apiKey/baseURL injection below
   } else {
     process.stderr.write('[clawgod] Warning: type=' + config.type + ' but no API key found\n');
   }
@@ -1539,12 +1559,16 @@ if (_proxyTypes[config.type]) {
 const hasProviderApiKey = !!config.apiKey;
 
 if (hasProviderApiKey) {
-  process.env.ANTHROPIC_API_KEY = config.apiKey;
   if (config.baseURL) process.env.ANTHROPIC_BASE_URL = config.baseURL;
   if (config.model) process.env.ANTHROPIC_MODEL = config.model;
   if (config.smallModel) process.env.ANTHROPIC_SMALL_FAST_MODEL = config.smallModel;
   if (config.baseURL && !/anthropic\.com/i.test(config.baseURL)) {
-    process.env.ANTHROPIC_AUTH_TOKEN ??= config.apiKey;
+    delete process.env.ANTHROPIC_API_KEY;
+    const existingToken = (process.env.ANTHROPIC_AUTH_TOKEN || '').trim();
+    process.env.ANTHROPIC_AUTH_TOKEN = existingToken || config.apiKey;
+  } else {
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+    process.env.ANTHROPIC_API_KEY = config.apiKey;
   }
 } else if (config.baseURL && config.baseURL !== defaultConfig.baseURL) {
   process.env.ANTHROPIC_BASE_URL ??= config.baseURL;
@@ -1560,25 +1584,21 @@ if (hasProviderApiKey) {
 // Users can force re-enable with CLAUDE_CODE_ATTRIBUTION_HEADER=1 if needed.
 if (config.baseURL && !/anthropic\.com/i.test(config.baseURL)) {
   process.env.CLAUDE_CODE_ATTRIBUTION_HEADER ??= '0';
-  // Third-party proxies (headroom, etc.) often require remote control.
-  // Lean mode sets disableRemoteControl:true in settings.json \u2014 undo it
-  // when the user is routing through a non-Anthropic endpoint.
-  try {
-    const _rcSettings = join(homedir(), '.claude', 'settings.json');
-    if (existsSync(_rcSettings)) {
-      const _rcS = JSON.parse(readFileSync(_rcSettings, 'utf8'));
-      if (_rcS.disableRemoteControl) {
-        delete _rcS.disableRemoteControl;
-        writeFileSync(_rcSettings, JSON.stringify(_rcS, null, 2) + '\n');
-      }
-    }
-  } catch {}
+}
+
+if (config.effort) {
+  process.env.CLAUDE_CODE_EFFORT_LEVEL ??= config.effort;
 }
 
 if (config.timeoutMs) {
   process.env.API_TIMEOUT_MS ??= String(config.timeoutMs);
 }
-process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ??= '1';
+// Remote Control needs GrowthBook evaluation. Restrict network traffic by
+// default only in max mode; on/off retain upstream eligibility checks.
+// Explicit user environment settings still take precedence.
+if (existsSync(join(clawgodDir, '.lean-max')) && !existsSync(join(clawgodDir, '.lean-disabled'))) {
+  process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ??= '1';
+}
 process.env.DISABLE_INSTALLATION_CHECKS ??= '1';
 // Use system ripgrep (extracted vendor rg path was build-time-baked; system
 // rg is the most reliable fallback under Bun runtime).
@@ -1614,8 +1634,8 @@ if (process.argv.includes('--lean-off') || process.argv.includes('--lean-on') ||
   const _leanSettings = join(homedir(), '.claude', 'settings.json');
   const _baseDeny = ['DesignSync','NotebookEdit','PushNotification','RemoteTrigger','CronCreate','CronDelete','CronList'];
   const _maxDeny = ['EnterPlanMode','ExitPlanMode','SendMessage','ScheduleWakeup','AskUserQuestion','ReportFindings'];
-  const _baseFlags = ['disableWorkflows','disableRemoteControl','disableClaudeAiConnectors','disableArtifact'];
-  const _maxFlags = ['disableBundledSkills'];
+  const _baseFlags = ['disableWorkflows','disableClaudeAiConnectors','disableArtifact'];
+  const _maxFlags = ['disableBundledSkills','disableRemoteControl'];
   const _allDeny = new Set([..._baseDeny, ..._maxDeny]);
   const _allFlags = [..._baseFlags, ..._maxFlags];
   const _unlink = function(p) { try { require('fs').unlinkSync(p); } catch {} };
@@ -1712,6 +1732,12 @@ try {
     });
   }
 } catch { /* guard is best-effort \u2014 never block the CLI on it */ }
+// Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
+// Anthropic-private Bun API that stock Bun does not ship. Without it the
+// renderer throws before the first frame and the TUI looks hung, so the shim
+// re-implements the API in JS. No-op when the real API exists or when the
+// bun-ant-shim feature is off (patches.json / CLAWGOD_FEATURE_BUN_ANT_SHIM).
+require('./bun-ant-shim.cjs');
 
 require('./cli.original.cjs');
 '@ | Set-Content (Join-Path $ClawDir "cli.cjs") -Encoding UTF8
@@ -1730,9 +1756,8 @@ Write-OK "Wrapper created (cli.cjs)"
 // helper means editing this single file \u2014 no build.js / cli.cjs / template
 // changes. (feature-gates.cjs is a future merge target here.)
 //
-// These are value parsers only: the injected patch code owns its own gating
-// (globalThis.__clawgodPatches?.[...]) and env reads, and feeds the raw
-// value in here for parsing/validation.
+// Helpers return values only: injected code owns gating, env reads, timers,
+// and mutation of the renderer's state.
 
 // Parses a CLAWGOD_CLASSIFIER_TIMEOUT_MS value to a finite number, or null
 // when it cannot be parsed (missing/blank/non-numeric/Infinity/overflow). The
@@ -1746,11 +1771,35 @@ function classifierTimeoutFloor(envValue) {
   return Number.isFinite(value) ? value : null;
 }
 
+// A DA1 reply can arrive in multiple stdin reads (issue #171). The renderer
+// normally flushes incomplete escapes after 50ms, which turns a split ESC [
+// into a key and lets the reply's suffix reach the text input. While a DA1
+// sentinel is outstanding, allow the same 2s inter-read budget upstream uses
+// for recognized control-sequence prefixes. This also covers 2.1.263, whose
+// longer-prefix handling predates that upstream fix.
+//
+// Do not filter input: ordinary keys, paste, and complete sequences still go
+// through the existing parser immediately. A lone Escape or Alt+[ during a
+// pending probe is delayed, then passed to the original parser on timeout.
+// With no outstanding probe, even those keys retain their usual timing.
+function terminalReplyDelay(querier, reader, now) {
+  const parse = reader?.parse;
+  if (parse?.mode !== 'NORMAL' || typeof parse.incomplete !== 'string') return 0;
+  if (!/^\x1b(?:\[(?:\?[\d;]*)?)?$/.test(parse.incomplete)) return 0;
+  // 2.1.263 writes queue entries immediately. 2.1.274 adds `written`, and
+  // may queue probes before stdin attaches; those cannot have replies yet.
+  if (!Array.isArray(querier?.queue) || !querier.queue.some((entry) =>
+    entry?.kind === 'barrier' || (entry?.kind === 'sentinel' && entry.written !== false))) return 0;
+  if (!Number.isFinite(now) || !Number.isFinite(reader.lastInputAt)) return 0;
+  return Math.max(0, 2000 - Math.max(0, now - reader.lastInputAt));
+}
+
 // The runtime container (globalThis.__clawgodHelpers) IS the module's own
 // exports, so a new helper only needs an export line here to be reachable
 // from the patched bundle \u2014 no separate registration object. We expose
 // module.exports, not module (the latter carries id/filename/paths metadata).
 module.exports.classifierTimeoutFloor = classifierTimeoutFloor;
+module.exports.terminalReplyDelay = terminalReplyDelay;
 globalThis.__clawgodHelpers = module.exports;
 '@ | Set-Content (Join-Path $ClawDir "runtime-helpers.cjs") -Encoding UTF8
 Write-OK "Classifier helper created (runtime-helpers.cjs)"
@@ -1920,6 +1969,443 @@ function installAssetSpawnGuard(cp, options) {
 module.exports = { installAssetSpawnGuard, assetInvocation, retargetArgs, isAssetPath, isInterpreterCommand };
 '@ | Set-Content (Join-Path $ClawDir "asset-guard.cjs") -Encoding UTF8
 Write-OK "Asset execution guard created (asset-guard.cjs)"
+# --- Write Bun.ant runtime shim ---------------------------------------
+# Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
+# Anthropic-private Bun API that stock Bun does not ship. cli.cjs loads this
+# shim before the bundle; without it the TUI never paints.
+
+@'
+'use strict';
+/**
+ * clawgod \u2014 `Bun.ant` runtime shim.
+ *
+ * Claude Code 2.1.271 moved its Ink renderer onto `Bun.ant.CellSegmenter`, an
+ * Anthropic-private Bun API that ships only inside the bundled native binary.
+ * clawgod runs the extracted JS bundle on the user's own Bun, which has no
+ * `Bun.ant` namespace, so the renderer threw before the first frame: the TUI
+ * never painted while the process stayed alive and looked hung (issue #183).
+ * The native binary (`claude.orig`) was unaffected.
+ *
+ * This module implements the API surface the renderer consumes. cli.cjs loads
+ * it before cli.original.cjs, and it no-ops when the real API is present.
+ *
+ * Contract (reverse-engineered from the 2.1.271+ bundle, pinned by
+ * bun-ant-shim.test.mjs):
+ *
+ *   new CellSegmenter({ ambiguousIsNarrow, substitute, screen, tabWidth })
+ *   .graphemes / .sgrKeys / .sgrCloseKeys / .uris   per-run tables, strings
+ *   .segment(text, cellsOut, runsOut, reordered) -> cell count
+ *       cellsOut: 2 int32 per cell \u2014 [graphemeIndex, (run << 10) | tab | width]
+ *       runsOut:  2 int32 per run  \u2014 [styleId, uriIndex]
+ *       Negative return = required cell capacity (caller reallocates).
+ *   .paint(targetCells, targetWidth, x, y, cells, count, _unused, charMap, words)
+ *   .setCell(targetCells, targetWidth, x, y, charId, packedStyle)
+ *       Both return end * 2^36 + first * 2^20 + end for a nonempty span.
+ *       I0() decodes the upper fields as damage bounds; j0()/xC() return the
+ *       low field as the absolute ending column for soft-wrap metadata.
+ *
+ * The `substitute` option (bidi control ranges) needs no handling: the controls
+ * are zero width already, which is what the option asks for.
+ *
+ * The tables are mutated in place: the bundle caches the four arrays once per
+ * renderer instance. SGR state persists across segment() calls, so a style
+ * spanning a wrapped line survives.
+ *
+ * Toggle: patches.json {"bun-ant-shim": false} or CLAWGOD_FEATURE_BUN_ANT_SHIM=false
+ */
+
+const SCREEN_DEFAULTS = {
+  widthMask: 3, narrow: 0, wide: 1, spacerTail: 2, spacerHead: 3,
+  emptyCharIndex: 0, spacerCharIndex: 1, tabWidth: 8,
+};
+
+const STYLE_SHIFT = 17;
+const LINK_SHIFT = 2;
+const LINK_MASK = 32767;
+const WIDTH_MASK = 255;
+const TAB_FLAG = 256;
+const RUN_SHIFT = 10;
+const DAMAGE_SPAN = 1048576; // 2^20 \u2014 field holding the first column
+const DAMAGE_END = 68719476736; // 2^36 \u2014 field holding the end column
+
+// SGR attributes that occupy one style slot, as param -> [slot, closeParam].
+// The bundle's style pool only accepts single-parameter codes, so combined
+// sequences are split below.
+const SGR_ATTRS = new Map([
+  [1, ['bold', 22]],
+  [2, ['dim', 22]],
+  [3, ['italic', 23]],
+  [4, ['underline', 24]],
+  [5, ['blink', 25]],
+  [6, ['blink-fast', 25]],
+  [7, ['inverse', 27]],
+  [8, ['hidden', 28]],
+  [9, ['strike', 29]],
+  [21, ['underline-double', 24]],
+  [53, ['overline', 55]],
+]);
+
+// Closing params, as closeParam -> slots it clears (22 and 24 each cover the
+// two attributes they close).
+const SGR_CLOSES = new Map([
+  [22, ['bold', 'dim']],
+  [23, ['italic']],
+  [24, ['underline', 'underline-double']],
+  [25, ['blink', 'blink-fast']],
+  [27, ['inverse']],
+  [28, ['hidden']],
+  [29, ['strike']],
+  [39, ['fg']],
+  [49, ['bg']],
+  [55, ['overline']],
+  [59, ['underline-color']],
+]);
+
+// Extended colours (38/48/58) and the 30-37/90-97 fg, 40-47/100-107 bg ranges.
+const SGR_EXTENDED = new Map([
+  [38, ['fg', 39]],
+  [48, ['bg', 49]],
+  [58, ['underline-color', 59]],
+]);
+
+function slotFor(param) {
+  const attr = SGR_ATTRS.get(param);
+  if (attr) return attr;
+  const extended = SGR_EXTENDED.get(param);
+  if (extended) return extended;
+  if ((param >= 30 && param <= 37) || (param >= 90 && param <= 97)) return ['fg', 39];
+  if ((param >= 40 && param <= 47) || (param >= 100 && param <= 107)) return ['bg', 49];
+  return null;
+}
+
+function sgrCode(params) {
+  return '\x1b[' + params + 'm';
+}
+
+// \u2500\u2500\u2500 Grapheme segmentation & width \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+let graphemeSegmenter;
+let graphemeSegmenterResolved = false;
+
+function graphemeIterator() {
+  if (!graphemeSegmenterResolved) {
+    graphemeSegmenterResolved = true;
+    try {
+      graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    } catch {
+      graphemeSegmenter = null;
+    }
+  }
+  return graphemeSegmenter;
+}
+
+// Approximate East Asian Wide/Fullwidth + emoji ranges, used only when
+// Bun.stringWidth is unavailable (the CI unit test runs under plain Node).
+const FALLBACK_WIDE = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1F64F}\u{1F900}-\u{1F9FF}\u{20000}-\u{2FFFD}\u{30000}-\u{3FFFD}]/u;
+
+function fallbackWidth(grapheme) {
+  if (/^\p{M}+$/u.test(grapheme)) return 0;
+  for (const ch of grapheme) if (FALLBACK_WIDE.test(ch)) return 2;
+  return 1;
+}
+
+function graphemeWidth(grapheme, ambiguousIsNarrow) {
+  const bun = typeof Bun === 'object' && Bun !== null ? Bun : undefined;
+  if (bun && typeof bun.stringWidth === 'function') {
+    try {
+      const width = bun.stringWidth(grapheme, { ambiguousIsNarrow: ambiguousIsNarrow === true });
+      if (Number.isFinite(width) && width >= 0) return width | 0;
+    } catch {}
+  }
+  return fallbackWidth(grapheme);
+}
+
+// \u2500\u2500\u2500 Escape scanner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+// Text, SGR, OSC-8 hyperlinks, and any other escape (dropped \u2014 a `write` op
+// only carries styling).
+const ESCAPE_SCAN = /\x1b\[([0-9;]*)m|\x1b\]8;([^;\x07\x1b]*);([^\x07\x1b]*)(?:\x07|\x1b\\)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[@-~]|\x1b[@-Z\\-_]/g;
+
+function scanChunks(text) {
+  const chunks = [];
+  let last = 0;
+  ESCAPE_SCAN.lastIndex = 0;
+  for (let match; (match = ESCAPE_SCAN.exec(text)) !== null; ) {
+    if (match.index > last) chunks.push({ kind: 'text', value: text.slice(last, match.index) });
+    if (match[1] !== undefined) chunks.push({ kind: 'sgr', value: match[1] });
+    else if (match[3] !== undefined) chunks.push({ kind: 'osc8', value: match[3] });
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) chunks.push({ kind: 'text', value: text.slice(last) });
+  return chunks;
+}
+
+// \u2500\u2500\u2500 CellSegmenter \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+class CellSegmenter {
+  constructor(options) {
+    const opts = options || {};
+    const screen = opts.screen || {};
+    this.ambiguousIsNarrow = opts.ambiguousIsNarrow !== false;
+    this.tabWidth = Number.isFinite(opts.tabWidth) && opts.tabWidth > 0 ? opts.tabWidth | 0 : SCREEN_DEFAULTS.tabWidth;
+    const kind = (key) => screen[key] ?? SCREEN_DEFAULTS[key];
+    this.kinds = {
+      narrow: kind('narrow'), wide: kind('wide'),
+      spacerTail: kind('spacerTail'), spacerHead: kind('spacerHead'),
+    };
+    this.emptyCharIndex = kind('emptyCharIndex');
+    this.spacerCharIndex = kind('spacerCharIndex');
+
+    // Mutated in place \u2014 the renderer caches these arrays per instance.
+    this.graphemes = [' ', ''];
+    this.sgrKeys = [''];
+    this.sgrCloseKeys = [''];
+    this.uris = [''];
+
+    this._graphemeIndex = new Map([[' ', 0], ['', 1]]);
+    this._styleIndex = new Map();
+    this._uriIndex = new Map();
+    this._style = new Map();
+  }
+
+  _uriIndexFor(uri) {
+    let id = this._uriIndex.get(uri);
+    if (id === undefined) {
+      id = this.uris.length;
+      this.uris.push(uri);
+      this._uriIndex.set(uri, id);
+    }
+    return id;
+  }
+
+  _applySgr(params) {
+    const parts = params.split(';');
+    for (let i = 0; i < parts.length; i += 1) {
+      const raw = parts[i];
+      const param = raw === '' ? 0 : Number(raw);
+      if (!Number.isFinite(param)) continue;
+      if (param === 0) {
+        this._style.clear();
+        continue;
+      }
+      const closes = SGR_CLOSES.get(param);
+      if (closes) {
+        for (const slot of closes) this._style.delete(slot);
+        continue;
+      }
+      const extended = SGR_EXTENDED.get(param);
+      if (extended) {
+        // 38/48/58 take "5;n" or "2;r;g;b" operands. Consume them here so the
+        // loop does not read the operands as attribute params.
+        const mode = parts[i + 1];
+        let code;
+        if (mode === '5' && parts[i + 2] !== undefined) {
+          code = sgrCode(param + ';5;' + parts[i + 2]);
+          i += 2;
+        } else if (mode === '2' && parts[i + 4] !== undefined) {
+          code = sgrCode(param + ';2;' + parts[i + 2] + ';' + parts[i + 3] + ';' + parts[i + 4]);
+          i += 4;
+        } else {
+          code = sgrCode(param);
+        }
+        this._style.set(extended[0], { code, close: sgrCode(extended[1]) });
+        continue;
+      }
+      const slotEntry = slotFor(param);
+      if (slotEntry) {
+        this._style.set(slotEntry[0], { code: sgrCode(param), close: sgrCode(slotEntry[1]) });
+      } else {
+        // Unknown attribute: keep it as its own slot so the transition to the
+        // next style still closes it where the terminal understands the code.
+        this._style.set('param-' + param, { code: sgrCode(param), close: '' });
+      }
+    }
+  }
+
+  _styleId() {
+    if (this._style.size === 0) return 0;
+    const pairs = [];
+    for (const entry of this._style.values()) pairs.push(entry.code + '\u0000' + entry.close);
+    // Sort so the same attribute set reached via different SGR orderings
+    // (e.g. "1;7" vs "7;1") shares one style id instead of bloating the table.
+    pairs.sort();
+    const codes = pairs.map((pair) => pair.slice(0, pair.indexOf('\u0000')));
+    const closes = pairs.map((pair) => pair.slice(pair.indexOf('\u0000') + 1));
+    const key = codes.length + '|' + codes.join('\u0000') + '|' + closes.join('\u0000');
+    let id = this._styleIndex.get(key);
+    if (id === undefined) {
+      // IDs must remain stable for this instance: the renderer caches their
+      // resolved styles, and the current segment() may already reference them.
+      // The caller owns capacity/generation checks and rebuilds the segmenter
+      // together with its caches; never truncate these tables independently.
+      id = this.sgrKeys.length;
+      this.sgrKeys.push(codes.join('\u0000'));
+      this.sgrCloseKeys.push(closes.join('\u0000'));
+      this._styleIndex.set(key, id);
+    }
+    return id;
+  }
+
+  _graphemeId(grapheme) {
+    let id = this._graphemeIndex.get(grapheme);
+    if (id === undefined) {
+      id = this.graphemes.length;
+      this.graphemes.push(grapheme);
+      this._graphemeIndex.set(grapheme, id);
+    }
+    return id;
+  }
+
+  segment(text, cells, runs /* , reordered */) {
+    const source = typeof text === 'string' ? text : text == null ? '' : String(text);
+    const items = [];
+    let link = 0;
+    // The bundle re-runs segment() with grown arrays when this returns a
+    // negative count. _applySgr advances the persistent _style map, so a
+    // capacity-fail run must roll it back or the retry would re-apply the SGR
+    // codes on top of the already-advanced state and mis-style the leading
+    // text. _applySgr only set()s fresh objects / delete()s / clear()s, so a
+    // shallow copy is a faithful snapshot.
+    const styleSnapshot = new Map(this._style);
+
+    const push = (grapheme) => {
+      const isTab = grapheme === '\t';
+      items.push({
+        graphemeIndex: this._graphemeId(grapheme),
+        tab: isTab,
+        width: isTab ? 0 : graphemeWidth(grapheme, this.ambiguousIsNarrow),
+        style: this._styleId(),
+        link,
+      });
+    };
+
+    const segmenter = graphemeIterator();
+    for (const chunk of scanChunks(source)) {
+      if (chunk.kind === 'sgr') {
+        this._applySgr(chunk.value);
+        continue;
+      }
+      if (chunk.kind === 'osc8') {
+        link = chunk.value ? this._uriIndexFor(chunk.value) : 0;
+        continue;
+      }
+      if (segmenter) {
+        for (const entry of segmenter.segment(chunk.value)) push(entry.segment);
+      } else {
+        push(chunk.value);
+      }
+    }
+
+    const count = items.length;
+    if (cells.length < count * 2 || runs.length < count * 2) {
+      this._style = styleSnapshot;
+      return -count;
+    }
+
+    let runCount = 0;
+    let previous = null;
+    for (let i = 0; i < count; i += 1) {
+      const item = items[i];
+      if (!previous || previous.style !== item.style || previous.link !== item.link) {
+        runs[runCount * 2] = item.style;
+        runs[runCount * 2 + 1] = item.link;
+        runCount += 1;
+        previous = item;
+      }
+      item.run = runCount - 1;
+      cells[i * 2] = item.graphemeIndex;
+      cells[i * 2 + 1] = (item.run << RUN_SHIFT) | (item.tab ? TAB_FLAG : 0) | (item.width & WIDTH_MASK);
+    }
+    return count;
+  }
+
+  paint(target, targetWidth, x, y, cells, count, _unused, charMap, words) {
+    const columns = targetWidth | 0;
+    const emptyCharId = charMap ? charMap[this.emptyCharIndex] | 0 : this.emptyCharIndex;
+    const spacerCharId = charMap ? charMap[this.spacerCharIndex] | 0 : this.spacerCharIndex;
+    const rowBase = (y | 0) * columns;
+    let column = x | 0;
+    const first = column;
+
+    for (let i = 0; i < (count | 0); i += 1) {
+      const packed = cells[i * 2 + 1];
+      const run = packed >>> RUN_SHIFT;
+      const word = (words ? words[run] : 0) | 0;
+      const style = (word >>> STYLE_SHIFT) << STYLE_SHIFT;
+      // runWords() has already removed its cache's +1 sentinel offset.
+      const link = (word >>> LINK_SHIFT) & LINK_MASK;
+      const styleBits = style | (link << LINK_SHIFT);
+
+      if ((packed & TAB_FLAG) !== 0) {
+        const stop = this.tabWidth - (((column % this.tabWidth) + this.tabWidth) % this.tabWidth);
+        for (let k = 0; k < stop; k += 1) this._put(target, rowBase, columns, column + k, emptyCharId, styleBits | this.kinds.narrow);
+        column += stop;
+        continue;
+      }
+
+      const width = packed & WIDTH_MASK;
+      if (width >= 2) {
+        const charId = charMap ? charMap[cells[i * 2]] | 0 : cells[i * 2] | 0;
+        this._put(target, rowBase, columns, column, charId, styleBits | this.kinds.wide);
+        this._put(target, rowBase, columns, column + 1, spacerCharId, styleBits | this.kinds.spacerTail);
+        column += 2;
+      } else if (width === 1) {
+        const charId = charMap ? charMap[cells[i * 2]] | 0 : cells[i * 2] | 0;
+        this._put(target, rowBase, columns, column, charId, styleBits | this.kinds.narrow);
+        column += 1;
+      }
+      // width 0 (combining mark, bidi control): no cell of its own.
+    }
+
+    return packDamage(first, column);
+  }
+
+  setCell(target, targetWidth, x, y, charId, packedStyle) {
+    const columns = targetWidth | 0;
+    const column = x | 0;
+    const row = y | 0;
+    if (column < 0 || column >= columns || row < 0) return 0;
+    this._put(target, row * columns, columns, column, charId, packedStyle);
+    return packDamage(column, column + 1);
+  }
+
+  _put(target, rowBase, columns, column, charId, packed) {
+    if (column < 0 || column >= columns) return;
+    const index = (rowBase + column) << 1;
+    target[index] = charId;
+    target[index + 1] = packed;
+  }
+}
+
+function packDamage(first, end) {
+  if (end <= first) return 0;
+  return end * DAMAGE_END + first * DAMAGE_SPAN + end;
+}
+
+// \u2500\u2500\u2500 Installation \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+function install() {
+  if (typeof Bun !== 'object' || Bun === null) return false;
+  if (typeof Bun.ant === 'object' && Bun.ant !== null && typeof Bun.ant.CellSegmenter === 'function') return false;
+  if (globalThis.__clawgodPatches && globalThis.__clawgodPatches['bun-ant-shim'] === false) return false;
+  try {
+    if (typeof Bun.ant !== 'object' || Bun.ant === null) Bun.ant = {};
+    Bun.ant.CellSegmenter = CellSegmenter;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+module.exports = { CellSegmenter, install, packDamage, scanChunks };
+
+if (install() && process.env.CLAWGOD_BUN_ANT_SHIM_DEBUG === '1') {
+  // stderr only (stdout belongs to the TUI renderer), opt-in: the install log
+  // already names the renderer runtime path on every (re)install.
+  process.stderr.write('[clawgod] Bun.ant shim active (Claude Code >= 2.1.271 renderer on stock Bun)\n');
+}
+'@ | Set-Content (Join-Path $ClawDir "bun-ant-shim.cjs") -Encoding UTF8
+Write-OK "Bun.ant runtime shim created (bun-ant-shim.cjs)"
 
 # --- Write universal patcher ------------------------------------------
 # (Same Node.js patcher as bash version -- inline to avoid extra download)
@@ -2005,6 +2491,19 @@ const gate = (id) => `globalThis.__clawgodPatches?.[${JSON.stringify(id)}]!==!1`
 // \u2500\u2500\u2500 Regex-based patches (version-agnostic) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
 const patches = [
+  {
+    id: 'terminal-reply-fragments',
+    name: 'Preserve split terminal replies while a DA1 probe is pending',
+    // Extend only the incomplete-input timer, using the renderer's own query
+    // queue. Keep parsing/delivery unchanged, including when the helper is
+    // absent in an older wrapper. Anchoring the whole callback prefix avoids
+    // matching unrelated performance.now()/parser calls or patching twice.
+    pattern: /(flushIncomplete=\(\)=>\{if\(this\.incompleteEscapeTimer=null,![\w$]+\(this\.keyReader\)\)return;if\(this\.props\.stdin\.readableLength>0\)\{this\.incompleteEscapeTimer=setTimeout\(this\.flushIncomplete,[\w$]+\);return\}let ([\w$]+)=performance\.now\(\);)(this\.applyKeysRead\([\w$]+\(this\.keyReader,\2\),\2\)\})/g,
+    replacer: (m, prefix, now, suffix) => prefix +
+      `const _clawgodReplyDelay=globalThis.__clawgodHelpers?.terminalReplyDelay?.(this.querier,this.keyReader,${now})??0;` +
+      'if(_clawgodReplyDelay>0){this.incompleteEscapeTimer=setTimeout(this.flushIncomplete,_clawgodReplyDelay);return}' + suffix,
+    optional: true, // Older or future renderers may have a different input loop.
+  },
   {
     id: 'user-type-ant',
     name: 'USER_TYPE \u2192 ant',
@@ -2245,11 +2744,13 @@ const patches = [
     // v2.1.158+: if(q!=="firstParty"&&q!=="anthropicAws"&&($==="claude-opus-4-6"||\u2026))return!1;
     // v2.1.214+: if(r!=="firstParty"&&!d6(r)&&(t==="claude-opus-4-6"||\u2026))return!1;
     //   "anthropicAws" replaced by helper function !fn(var).
-    //   Match both: \1!=="anthropicAws" OR !fn(\1).
+    // v2.1.280+: if(Fin()&&(n==="claude-opus-4-6"||\u2026))return!1;
+    //   Fin() now contains the provider check. Keep the original condition
+    //   behind the feature gate so disabling the patch restores upstream.
     id: 'auto-mode-inline-gate',
     toggleable: true,
     name: 'Auto-mode unlock for third-party API (inline gate)',
-    pattern: /if\(([\w$]+)!=="firstParty"&&(?:\1!=="anthropicAws"|![\w$]+\(\1\))[^;]*\)return!1;/g,
+    pattern: /if\((?:([\w$]+)!=="firstParty"&&(?:\1!=="anthropicAws"|![\w$]+\(\1\))[^;]*|[\w$]+\(\)&&\([\w$]+==="claude-opus-4-6"\|\|[\w$]+==="claude-sonnet-4-6"\|\|[\w$]+\.includes\("haiku"\)\))\)return!1;/g,
     replacer: (m) => `if(globalThis.__clawgodPatches?.[${JSON.stringify('auto-mode-inline-gate')}]===!1&&` + m.slice(3, -10) + `)return!1;`,
     sentinel: '!=="firstParty"&&',
   },
@@ -2902,6 +3403,30 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+# --- Report which renderer runtime this Claude Code build needs -------
+# 2.1.271+ renders through Bun.ant.CellSegmenter, an Anthropic-private Bun
+# API; cli.cjs answers it with bun-ant-shim.cjs. Older builds use plain Bun
+# APIs and ignore the shim.
+$needsShim = $false
+$bunfsDir = Join-Path $ClawDir "bunfs"
+$targets = @()
+if (Test-Path $bunfsDir) {
+    $targets += Get-ChildItem -Path $bunfsDir -File -ErrorAction SilentlyContinue
+}
+$entry = Join-Path $ClawDir "cli.original.cjs"
+if (Test-Path $entry) { $targets += Get-Item $entry }
+# Scan every extracted chunk (`.js` and `.mjs`) plus the entry point, matching
+# the POSIX side, so the report fires when any of them references the API.
+$hit = $targets |
+    Select-String -Pattern 'Bun\.ant\.CellSegmenter' -List -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($hit) { $needsShim = $true }
+if ($needsShim) {
+    Write-Dim "Renderer runtime: Bun.ant.CellSegmenter (Claude >= 2.1.271) - served by bun-ant-shim.cjs"
+} else {
+    Write-Dim "Renderer runtime: stock Bun APIs (shim present but unused)"
+}
+
 # --- Create default configs -------------------------------------------
 
 $featuresFile = Join-Path $ClawDir "features.json"
@@ -2969,16 +3494,25 @@ if (-not (Test-Path $leanOffFlag)) {
     $leanApplyScript = @'
 const fs = require("fs");
 const settingsPath = process.argv[1];
-const isMax = process.argv[2] === "true";
+const isMax = process.argv[2]?.toLowerCase() === "true";
 const baseDeny = ["DesignSync","NotebookEdit","PushNotification","RemoteTrigger","CronCreate","CronDelete","CronList"];
 const maxDeny = ["EnterPlanMode","ExitPlanMode","SendMessage","ScheduleWakeup","AskUserQuestion","ReportFindings"];
-const baseFlags = ["disableWorkflows","disableRemoteControl","disableClaudeAiConnectors","disableArtifact"];
-const maxFlags = ["disableBundledSkills"];
+const baseFlags = ["disableWorkflows","disableClaudeAiConnectors","disableArtifact"];
+const maxFlags = ["disableBundledSkills","disableRemoteControl"];
 const deny = isMax ? [...baseDeny, ...maxDeny] : baseDeny;
 const flags = isMax ? [...baseFlags, ...maxFlags] : baseFlags;
 let s = {};
 try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch {}
 let changed = false;
+// Downgrade max to on and migrate the old default Remote Control disable.
+if (!isMax) {
+  for (const k of maxFlags) { if (k in s) { delete s[k]; changed = true; } }
+  if (Array.isArray(s.permissions?.deny)) {
+    const before = s.permissions.deny.length;
+    s.permissions.deny = s.permissions.deny.filter(t => !maxDeny.includes(t));
+    if (s.permissions.deny.length !== before) changed = true;
+  }
+}
 for (const k of flags) { if (!(k in s)) { s[k] = true; changed = true; } }
 if (!s.permissions) s.permissions = {};
 if (!Array.isArray(s.permissions.deny)) s.permissions.deny = [];

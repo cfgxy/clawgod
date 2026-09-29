@@ -83,13 +83,16 @@ irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 | ie
 | 功能 | 作用 |
 |------|------|
 | **Glob/Grep 恢复** | Bun 编译时将 `EMBEDDED_SEARCH_TOOLS=true` 内联为字面量，导致内置 Glob/Grep 工具被隐藏。Patch 还原 env 检查并加入 bfs/ugrep 可用性检测——在 Bun runtime 下运行时工具自动恢复 |
+| **渲染器 Shim（2.1.271+）** | Claude Code 2.1.271 的 TUI 渲染器依赖 `Bun.ant.CellSegmenter`，这是 Anthropic 自带 Bun 才有的私有 API。ClawGod 在 patched bundle 前加载一份 JS 实现，让 TUI 在标准 Bun 上正常绘制，而不是在第一帧前卡住 |
 | **1h Prompt Cache** | 强制启用 1h TTL allowlist（默认实际是 5m → 空闲后导致大量 cache_creation token 浪费） |
 | **第三方 Cache 修复** | 当 `baseURL` 指向非 Anthropic 域名时自动关闭 `x-anthropic-billing-header`。该 header 里的 `cch` 字段每请求都变，会让 DeepSeek / OneAPI / Bedrock / vLLM 以及所有 Anthropic 协议代理的 prompt-cache 命中率归零。不需要再自行配置 `CLAUDE_CODE_ATTRIBUTION_HEADER=0`。 |
 | **自动重打补丁** | 检测到用户官方升级了 native Claude binary 时，下次启动自动重新抽取 + 重新 patch |
 | **更新通知** | 每 24h 异步检查 GitHub releases（非阻塞），发现新版本时启动前显示一行提示 |
-| **精简设置** | 三级 token 优化，作用于 `~/.claude/settings.json`。**on**（默认）：移除未使用工具定义 + 禁用 Workflows/RemoteControl/Artifact。**max**：额外移除 Plan mode、Agent Teams、内置 skills。**off**：恢复全部工具 |
+| **精简设置** | 三级 token 优化，作用于 `~/.claude/settings.json`。**on**（默认）：移除未使用工具定义 + 禁用 Workflows/Artifact，保留 Remote Control。**max**：额外禁用 Remote Control，并移除 Plan mode、Agent Teams、内置 skills。**off**：恢复全部工具 |
 
 > **精简设置**不会破坏现有配置，更新时保持用户选择。随时切换：`claude --lean-on`（默认）/ `claude --lean-max`（激进）/ `claude --lean-off`（恢复全部）。取消单项设置只需自行修改（如 `"disableArtifact": false`）。
+
+Remote Control（`/remote-control`、`/rc`）在 **on/off** 下允许使用，仅在 **max** 下默认禁用。默认 on 模式更新安装或执行 `claude --lean-on` 会清除旧版 Lean 遗留的远程控制禁用项。仅 **max** 默认设置 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`；用户显式设置的环境变量限制保持不变。远程控制仍需满足上游账号、认证、端点及组织策略要求。
 
 ## 使用
 
@@ -111,12 +114,14 @@ claude.orig         # 原版未修改版本（自动备份）
   "baseURL": "https://api.anthropic.com",
   "model": "",
   "smallModel": "",
+  "effort": "",
   "timeoutMs": 3000000
 }
 ```
 
 - **填写 `apiKey`**：ClawGod 注入 `ANTHROPIC_API_KEY` 并与 `~/.claude/settings.json` 隔离。可用于 Anthropic 官方、DeepSeek，以及任何 OpenAI-compatible 网关；`baseURL` 指向非 Anthropic 域名时，还会自动注入 `ANTHROPIC_AUTH_TOKEN` 以适配网关鉴权。
 - **留空 `apiKey`**：走 OAuth 路径，执行一次 `claude auth login`，`~/.claude` 下的 subagents / skills / MCP 配置继续有效。
+- **`effort`**：设置推理强度，已有的 `CLAUDE_CODE_EFFORT_LEVEL` 优先。使用 `type: "grok"` 或 `"openai-compat"` 时，即使 Claude 没有为自定义模型发送 effort，代理也会发送配置对应的 `reasoning_effort`。`low`、`medium`、`high`、`xhigh` 原样传递，`max` 转为 `xhigh`，`auto` 则省略该参数、使用上游默认值。请选用上游模型支持的档位。配置为空或未设置时，沿用请求中的 effort；请求也未指定时不添加该参数。
 
 ### 功能开关
 
@@ -142,6 +147,7 @@ claude.orig         # 原版未修改版本（自动备份）
 | `cautious-actions` | 移除 "Executing actions with care" 段落 |
 | `not-logged-in` | 移除 "Not logged in" 提示 |
 | `message-filter` | 绕过非 ant 用户的消息/附件过滤 |
+| `bun-ant-shim` | Claude Code 2.1.271+ 的 `Bun.ant.CellSegmenter` 渲染器 shim（见「可靠性」） |
 
 仅对单次启动生效时用环境变量——feature id 大写、连字符转下划线：
 
@@ -160,6 +166,7 @@ CLAWGOD_FEATURE_GEO_NEUTRALIZE=true claude # 临时恢复 patches.json 里关闭
 4. 把 `/$bunfs/...` 虚拟路径重写到本地 vendor 路径
 5. 应用 29 条正则 patch（跨版本兼容，同一组 regex 覆盖多个 release）
 6. `claude` / `clawgod` launcher 在 Bun runtime 下跑 patched cli.js
+7. 在 patched cli.js 之前加载 `bun-ant-shim.cjs`，补上 Claude Code 2.1.271+ 需要的 `Bun.ant.CellSegmenter` 渲染接口
 
 `~/.clawgod/.source-version` 标记当时被 patch 的版本号。每次启动 wrapper 比对它和 `versions/` 里最新二进制；如果用户走官方途径升级了 Claude Code，下次启动会自动重打补丁。
 

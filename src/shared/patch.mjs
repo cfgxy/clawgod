@@ -79,6 +79,19 @@ const gate = (id) => `globalThis.__clawgodPatches?.[${JSON.stringify(id)}]!==!1`
 
 const patches = [
   {
+    id: 'terminal-reply-fragments',
+    name: 'Preserve split terminal replies while a DA1 probe is pending',
+    // Extend only the incomplete-input timer, using the renderer's own query
+    // queue. Keep parsing/delivery unchanged, including when the helper is
+    // absent in an older wrapper. Anchoring the whole callback prefix avoids
+    // matching unrelated performance.now()/parser calls or patching twice.
+    pattern: /(flushIncomplete=\(\)=>\{if\(this\.incompleteEscapeTimer=null,![\w$]+\(this\.keyReader\)\)return;if\(this\.props\.stdin\.readableLength>0\)\{this\.incompleteEscapeTimer=setTimeout\(this\.flushIncomplete,[\w$]+\);return\}let ([\w$]+)=performance\.now\(\);)(this\.applyKeysRead\([\w$]+\(this\.keyReader,\2\),\2\)\})/g,
+    replacer: (m, prefix, now, suffix) => prefix +
+      `const _clawgodReplyDelay=globalThis.__clawgodHelpers?.terminalReplyDelay?.(this.querier,this.keyReader,${now})??0;` +
+      'if(_clawgodReplyDelay>0){this.incompleteEscapeTimer=setTimeout(this.flushIncomplete,_clawgodReplyDelay);return}' + suffix,
+    optional: true, // Older or future renderers may have a different input loop.
+  },
+  {
     id: 'user-type-ant',
     name: 'USER_TYPE → ant',
     pattern: /function ([\w$]+)\(\)\{return"external"\}/g,
@@ -318,11 +331,13 @@ const patches = [
     // v2.1.158+: if(q!=="firstParty"&&q!=="anthropicAws"&&($==="claude-opus-4-6"||…))return!1;
     // v2.1.214+: if(r!=="firstParty"&&!d6(r)&&(t==="claude-opus-4-6"||…))return!1;
     //   "anthropicAws" replaced by helper function !fn(var).
-    //   Match both: \1!=="anthropicAws" OR !fn(\1).
+    // v2.1.280+: if(Fin()&&(n==="claude-opus-4-6"||…))return!1;
+    //   Fin() now contains the provider check. Keep the original condition
+    //   behind the feature gate so disabling the patch restores upstream.
     id: 'auto-mode-inline-gate',
     toggleable: true,
     name: 'Auto-mode unlock for third-party API (inline gate)',
-    pattern: /if\(([\w$]+)!=="firstParty"&&(?:\1!=="anthropicAws"|![\w$]+\(\1\))[^;]*\)return!1;/g,
+    pattern: /if\((?:([\w$]+)!=="firstParty"&&(?:\1!=="anthropicAws"|![\w$]+\(\1\))[^;]*|[\w$]+\(\)&&\([\w$]+==="claude-opus-4-6"\|\|[\w$]+==="claude-sonnet-4-6"\|\|[\w$]+\.includes\("haiku"\)\))\)return!1;/g,
     replacer: (m) => `if(globalThis.__clawgodPatches?.[${JSON.stringify('auto-mode-inline-gate')}]===!1&&` + m.slice(3, -10) + `)return!1;`,
     sentinel: '!=="firstParty"&&',
   },
