@@ -83,13 +83,16 @@ Green logo = patched. Orange logo = original.
 | Feature | What it does |
 |---------|-------------|
 | **Glob/Grep Restore** | Bun compile inlines `EMBEDDED_SEARCH_TOOLS=true`, hiding built-in Glob/Grep tools. Patch un-inlines the env check and adds bfs/ugrep binary availability detection — tools are restored when running under Bun runtime |
+| **Renderer Shim (2.1.271+)** | Claude Code 2.1.271 builds its TUI renderer on `Bun.ant.CellSegmenter`, a private API that only Anthropic's bundled Bun exposes. ClawGod loads a JS implementation before the patched bundle, so the TUI paints under stock Bun instead of stalling before the first frame |
 | **1h Prompt Cache** | Forces 1h TTL allowlist on (was effectively 5m → much higher cache_creation token usage) |
 | **Third-Party Cache Fix** | Auto-disables `x-anthropic-billing-header` when `baseURL` is non-Anthropic. The header's per-request `cch` field breaks prompt-cache hit rate on DeepSeek / OneAPI / Bedrock / vLLM and any other Anthropic-compatible proxy. You no longer need to set `CLAUDE_CODE_ATTRIBUTION_HEADER=0` yourself. |
 | **Auto Re-patch** | Detects when the user's native Claude binary has been upgraded; transparently re-extracts and re-patches on next launch |
 | **Update Notification** | Checks GitHub releases once per 24h (async, non-blocking). Shows a one-line notice if a newer ClawGod version is available |
-| **Lean Settings** | Three-level token optimization for `~/.claude/settings.json`. **on** (default): removes unused tool definitions + disables Workflows/RemoteControl/Artifact. **max**: additionally removes Plan mode, Agent Teams, bundled skills. **off**: all tools restored |
+| **Lean Settings** | Three-level token optimization for `~/.claude/settings.json`. **on** (default): removes unused tool definitions + disables Workflows/Artifact; Remote Control remains available. **max**: additionally disables Remote Control and removes Plan mode, Agent Teams, bundled skills. **off**: all tools restored |
 
 > **Lean Settings** are non-destructive and persist across updates. Toggle anytime: `claude --lean-on` (default) / `claude --lean-max` (aggressive) / `claude --lean-off` (restore all). To opt out of a single setting, set it yourself (e.g. `"disableArtifact": false`).
+
+Remote Control (`/remote-control`, `/rc`) is allowed in **on/off** and disabled by default only in **max**. Updating in **on** mode or running `claude --lean-on` clears the older Lean Remote Control disable setting. Only **max** defaults `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; explicit environment restrictions are preserved. Remote Control still requires upstream account, authentication, endpoint, and organization eligibility.
 
 ## Commands
 
@@ -111,12 +114,14 @@ claude.orig         # Original unpatched version (auto-backed-up)
   "baseURL": "https://api.anthropic.com",
   "model": "",
   "smallModel": "",
+  "effort": "",
   "timeoutMs": 3000000
 }
 ```
 
-- **`apiKey` set** → ClawGod injects it as `ANTHROPIC_API_KEY` and isolates from `~/.claude/settings.json`. Works with Anthropic, DeepSeek, and OpenAI-compatible gateways. A non-Anthropic `baseURL` also populates `ANTHROPIC_AUTH_TOKEN` for gateway auth.
+- **`apiKey` set** → ClawGod injects it as `ANTHROPIC_API_KEY` and isolates from `~/.claude/settings.json`. Works with Anthropic, DeepSeek, and OpenAI-compatible gateways. A non-Anthropic `baseURL` populates only `ANTHROPIC_AUTH_TOKEN` for gateway auth.
 - **`apiKey` empty** → OAuth path. Run `claude auth login` once; `~/.claude` keeps hosting your subagents, skills, and MCP settings.
+- **`effort`** → Sets reasoning effort; an existing `CLAUDE_CODE_EFFORT_LEVEL` takes precedence. With `type: "grok"` or `"openai-compat"`, the proxy sends `reasoning_effort` even when Claude omits effort for a custom model alias. `low`, `medium`, `high`, and `xhigh` pass through; `max` maps to `xhigh`; `auto` omits the parameter to use the upstream default. Choose a level supported by your upstream model. Empty/unset configuration leaves request-level effort in control and adds no effort parameter when the request has none.
 
 ### Feature Toggles
 
@@ -142,6 +147,7 @@ claude.orig         # Original unpatched version (auto-backed-up)
 | `cautious-actions` | Removes "Executing actions with care" section from system prompt |
 | `not-logged-in` | Removes "Not logged in" notice |
 | `message-filter` | Bypasses non-ant message/attachment filters |
+| `bun-ant-shim` | `Bun.ant.CellSegmenter` renderer shim for Claude Code 2.1.271+ (see Reliability) |
 
 For a single launch, set an env var instead — feature id upper-cased, dashes to underscores:
 
@@ -160,6 +166,7 @@ Since `@anthropic-ai/claude-code` v2.1.113, the npm package no longer ships `cli
 4. Rewrites `/$bunfs/...` virtual paths to point at the extracted modules
 5. Applies 29 regex-based patches (version-agnostic — same patches work across many releases)
 6. The `claude` / `clawgod` launchers run the patched cli.js under the Bun runtime
+7. Loads `bun-ant-shim.cjs` before the patched cli.js, supplying the `Bun.ant.CellSegmenter` renderer API that Claude Code 2.1.271+ expects
 
 A `.source-version` stamp in `~/.clawgod/` records which native version was patched. On every launch the wrapper compares it against the latest binary in `versions/`; if the user upgraded Claude Code via the official installer, ClawGod auto-re-patches on the next run.
 

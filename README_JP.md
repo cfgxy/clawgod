@@ -87,9 +87,11 @@ irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 | ie
 | **サードパーティ Cache 修正** | `baseURL` が Anthropic 以外を指す場合、`x-anthropic-billing-header` を自動的に無効化します。このヘッダーの `cch` フィールドはリクエストごとに変化するため、DeepSeek / OneAPI / Bedrock / vLLM など Anthropic 互換プロキシでは prompt-cache ヒット率がゼロになります。`CLAUDE_CODE_ATTRIBUTION_HEADER=0` を自分で設定する必要はもうありません。 |
 | **自動再パッチ** | ユーザーがネイティブ Claude バイナリをアップグレードすると、次回起動時に自動的に再抽出・再パッチ |
 | **アップデート通知** | 24時間ごとに GitHub releases を非同期チェック（ノンブロッキング）。新バージョンが利用可能な場合、起動前に1行の通知を表示 |
-| **リーン設定** | `~/.claude/settings.json` の3段階トークン最適化。**on**（デフォルト）：未使用ツール定義の削除 + Workflows/RemoteControl/Artifact 無効化。**max**：Plan mode、Agent Teams、内蔵スキルも追加削除。**off**：全ツール復元 |
+| **リーン設定** | `~/.claude/settings.json` の3段階トークン最適化。**on**（デフォルト）：未使用ツール定義の削除 + Workflows/Artifact 無効化（Remote Control は利用可能）。**max**：Remote Control を無効化し、Plan mode、Agent Teams、内蔵スキルも追加削除。**off**：全ツール復元 |
 
 > **リーン設定**は既存の設定を壊さず、アップデート後も選択が維持されます。いつでも切替：`claude --lean-on`（デフォルト）/ `claude --lean-max`（アグレッシブ）/ `claude --lean-off`（全復元）。個別設定の解除は自分で値を設定（例：`"disableArtifact": false`）。
+
+Remote Control（`/remote-control`、`/rc`）は **on/off** で利用可能、**max** のみデフォルトで無効です。on モードでの更新または `claude --lean-on` で旧 Lean の無効化設定を解除します。`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` のデフォルト設定も **max** のみ適用し、ユーザーが明示した環境変数は維持します。アカウント、認証、接続先、組織ポリシーの利用条件は引き続き適用されます。
 
 ## コマンド
 
@@ -111,12 +113,14 @@ claude.orig         # オリジナル未修正版（自動バックアップ）
   "baseURL": "https://api.anthropic.com",
   "model": "",
   "smallModel": "",
+  "effort": "",
   "timeoutMs": 3000000
 }
 ```
 
 - **`apiKey` を設定**：ClawGod が `ANTHROPIC_API_KEY` として注入し、`~/.claude/settings.json` から隔離します。Anthropic / DeepSeek など OpenAI 互換ゲートウェイでも動作。`baseURL` が Anthropic 以外を指す場合、ゲートウェイ認証用に `ANTHROPIC_AUTH_TOKEN` も自動設定されます。
 - **`apiKey` 未設定**：OAuth パス。一度 `claude auth login` を実行すれば、`~/.claude` 配下の subagents / skills / MCP はそのまま使えます。
+- **`effort`**：推論の強度を設定します。既存の `CLAUDE_CODE_EFFORT_LEVEL` が優先されます。`type: "grok"` または `"openai-compat"` では、Claude がカスタムモデルの effort を送信しなくても、プロキシが設定値を `reasoning_effort` として送信します。`low`、`medium`、`high`、`xhigh` はそのまま、`max` は `xhigh` に変換し、`auto` はパラメーターを省略して上流の既定値を使います。上流モデルが対応する値を選んでください。設定が空または未設定ならリクエストの effort を使い、リクエストにもなければ追加しません。
 
 ### 機能トグル
 

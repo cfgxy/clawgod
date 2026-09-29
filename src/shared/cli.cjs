@@ -38,6 +38,7 @@ const defaultConfig = {
   baseURL: 'https://api.anthropic.com',
   model: '',
   smallModel: '',
+  effort: '',
   timeoutMs: 3000000,
 };
 
@@ -69,8 +70,9 @@ if (_proxyTypes[config.type]) {
       apiKey: _proxyKey,
       baseURL: config.baseURL || (config.type === 'grok' ? 'https://api.x.ai/v1' : ''),
       model: config.model || '',
+      effort: process.env.CLAUDE_CODE_EFFORT_LEVEL ?? config.effort,
     });
-    process.env.ANTHROPIC_API_KEY = 'proxy-passthrough';
+    delete process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_BASE_URL = 'http://127.0.0.1:' + _proxy.port;
     process.env.ANTHROPIC_AUTH_TOKEN = 'proxy-passthrough';
     if (config.model) process.env.ANTHROPIC_MODEL = config.model;
@@ -79,7 +81,7 @@ if (_proxyTypes[config.type]) {
     process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS ??= '1';
     process.on('exit', function () { try { _proxy.stop(); } catch {} });
     process.stderr.write('[clawgod] OpenAI-compat proxy on port ' + _proxy.port + ' (type: ' + config.type + ')\n');
-    config = { ...defaultConfig };  // prevent fallthrough to apiKey/baseURL injection below
+    config = { ...config, apiKey: '', baseURL: '', model: '', smallModel: '' };  // prevent fallthrough to apiKey/baseURL injection below
   } else {
     process.stderr.write('[clawgod] Warning: type=' + config.type + ' but no API key found\n');
   }
@@ -88,12 +90,16 @@ if (_proxyTypes[config.type]) {
 const hasProviderApiKey = !!config.apiKey;
 
 if (hasProviderApiKey) {
-  process.env.ANTHROPIC_API_KEY = config.apiKey;
   if (config.baseURL) process.env.ANTHROPIC_BASE_URL = config.baseURL;
   if (config.model) process.env.ANTHROPIC_MODEL = config.model;
   if (config.smallModel) process.env.ANTHROPIC_SMALL_FAST_MODEL = config.smallModel;
   if (config.baseURL && !/anthropic\.com/i.test(config.baseURL)) {
-    process.env.ANTHROPIC_AUTH_TOKEN ??= config.apiKey;
+    delete process.env.ANTHROPIC_API_KEY;
+    const existingToken = (process.env.ANTHROPIC_AUTH_TOKEN || '').trim();
+    process.env.ANTHROPIC_AUTH_TOKEN = existingToken || config.apiKey;
+  } else {
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+    process.env.ANTHROPIC_API_KEY = config.apiKey;
   }
 } else if (config.baseURL && config.baseURL !== defaultConfig.baseURL) {
   process.env.ANTHROPIC_BASE_URL ??= config.baseURL;
@@ -109,25 +115,21 @@ if (hasProviderApiKey) {
 // Users can force re-enable with CLAUDE_CODE_ATTRIBUTION_HEADER=1 if needed.
 if (config.baseURL && !/anthropic\.com/i.test(config.baseURL)) {
   process.env.CLAUDE_CODE_ATTRIBUTION_HEADER ??= '0';
-  // Third-party proxies (headroom, etc.) often require remote control.
-  // Lean mode sets disableRemoteControl:true in settings.json — undo it
-  // when the user is routing through a non-Anthropic endpoint.
-  try {
-    const _rcSettings = join(homedir(), '.claude', 'settings.json');
-    if (existsSync(_rcSettings)) {
-      const _rcS = JSON.parse(readFileSync(_rcSettings, 'utf8'));
-      if (_rcS.disableRemoteControl) {
-        delete _rcS.disableRemoteControl;
-        writeFileSync(_rcSettings, JSON.stringify(_rcS, null, 2) + '\n');
-      }
-    }
-  } catch {}
+}
+
+if (config.effort) {
+  process.env.CLAUDE_CODE_EFFORT_LEVEL ??= config.effort;
 }
 
 if (config.timeoutMs) {
   process.env.API_TIMEOUT_MS ??= String(config.timeoutMs);
 }
-process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ??= '1';
+// Remote Control needs GrowthBook evaluation. Restrict network traffic by
+// default only in max mode; on/off retain upstream eligibility checks.
+// Explicit user environment settings still take precedence.
+if (existsSync(join(clawgodDir, '.lean-max')) && !existsSync(join(clawgodDir, '.lean-disabled'))) {
+  process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ??= '1';
+}
 process.env.DISABLE_INSTALLATION_CHECKS ??= '1';
 // Use system ripgrep (extracted vendor rg path was build-time-baked; system
 // rg is the most reliable fallback under Bun runtime).
@@ -163,8 +165,8 @@ if (process.argv.includes('--lean-off') || process.argv.includes('--lean-on') ||
   const _leanSettings = join(homedir(), '.claude', 'settings.json');
   const _baseDeny = ['DesignSync','NotebookEdit','PushNotification','RemoteTrigger','CronCreate','CronDelete','CronList'];
   const _maxDeny = ['EnterPlanMode','ExitPlanMode','SendMessage','ScheduleWakeup','AskUserQuestion','ReportFindings'];
-  const _baseFlags = ['disableWorkflows','disableRemoteControl','disableClaudeAiConnectors','disableArtifact'];
-  const _maxFlags = ['disableBundledSkills'];
+  const _baseFlags = ['disableWorkflows','disableClaudeAiConnectors','disableArtifact'];
+  const _maxFlags = ['disableBundledSkills','disableRemoteControl'];
   const _allDeny = new Set([..._baseDeny, ..._maxDeny]);
   const _allFlags = [..._baseFlags, ..._maxFlags];
   const _unlink = function(p) { try { require('fs').unlinkSync(p); } catch {} };
@@ -243,23 +245,53 @@ require('./feature-gates.cjs');
 // the patched bundle reaches helpers through globalThis only.
 require('./runtime-helpers.cjs');
 
-// Asset-execution guard (see asset-guard.cjs): in graph installs the bundled
-// skill-asset scripts (runner-scaffold / build-report-lite templates) are
-// real files, and claude ≥2.1.270 mis-resolves one as the CLI entry on some
-// Skill-tool paths — executing the template exits 2 and kills the session.
-// Graph installs only: the legacy single-bundle keeps the assets inside
-// cli.original.cjs where they cannot be spawned. Must wrap child_process
-// before the patched cli loads so every spawn it issues is covered.
+// Skill-template entry guard (see skill-entry-guard.cjs): in graph installs
+// the bundled skill templates (runner-scaffold / build-report-lite) are
+// extracted to real files under bunfs/, and claude's skill-file manifest
+// chunk evaluates them IN-PROCESS via import.meta.require() when a session
+// touches the skill table. An unguarded template then parses the host CLI's
+// argv and exits 2 on headless `-p` flags, killing the session before it
+// starts (the "unknown argument: -p" crash; intermittent because the
+// manifest chunk loads lazily). Heal the known templates idempotently
+// (.clawgod-orig backup + skill-entry-guard.log), then fail fast with an
+// explicit launcher error if any bunfs/*.mjs still carries unguarded
+// top-level entry code. Graph installs only: the legacy single-bundle keeps
+// the assets inside cli.original.cjs where they cannot be required.
 try {
-  const _assetGuardBunfsDir = join(clawgodDir, 'bunfs');
-  if (existsSync(_assetGuardBunfsDir)) {
-    const { installAssetSpawnGuard } = require('./asset-guard.cjs');
-    installAssetSpawnGuard(require('child_process'), {
-      bunfsDir: _assetGuardBunfsDir,
-      logFile: join(clawgodDir, 'asset-spawn-guard.log'),
-      cliExecPath: process.env.CLAUDE_CODE_EXECPATH || '',
-    });
+  const _segBunfsDir = join(clawgodDir, 'bunfs');
+  if (existsSync(_segBunfsDir)) {
+    const _seg = require('./skill-entry-guard.cjs');
+    const _segLog = join(clawgodDir, 'skill-entry-guard.log');
+    const _segReport = _seg.healSkillTemplates(_segBunfsDir, { logFile: _segLog });
+    for (const _u of _segReport.unmatched) {
+      process.stderr.write('[clawgod] skill-entry-guard: could not guard ' + _u.file + ' (' + _u.reason + ')\n');
+    }
+    const _segHits = _seg.scanSkillTemplateHazards(_segBunfsDir);
+    if (_segHits.length > 0) {
+      const _out = ['[clawgod] FATAL: unguarded skill template(s) in graph install.',
+        "[clawgod] Their top-level code runs in-process when claude's skill manifest",
+        '[clawgod] requires them at startup and can exit the whole CLI (the',
+        '[clawgod] "unknown argument: -p" startup crash):'];
+      for (const _h of _segHits) {
+        _out.push('[clawgod]   ' + _h.file + ' (line ' + _h.line + ', ' + _h.form + ')');
+      }
+      _out.push('[clawgod] Fix: re-run the clawgod installer to regenerate guarded templates, or');
+      _out.push("[clawgod] hand-wrap the file's top-level entry in `if (import.meta.main) { ... }`.");
+      process.stderr.write(_out.join('\n') + '\n');
+      try { _seg.appendGuardLog(_segLog, 'fatal', _segHits.map((_h) => _h.file + ':' + _h.line).join(', ')); } catch {}
+      process.exit(1);
+    }
   }
-} catch { /* guard is best-effort — never block the CLI on it */ }
+} catch (_segErr) {
+  // best-effort: a defect here must never brick the CLI - warn loudly instead
+  process.stderr.write('[clawgod] skill-entry-guard skipped: ' + ((_segErr && _segErr.message) || _segErr) + '\n');
+}
+
+// Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
+// Anthropic-private Bun API that stock Bun does not ship. Without it the
+// renderer throws before the first frame and the TUI looks hung, so the shim
+// re-implements the API in JS. No-op when the real API exists or when the
+// bun-ant-shim feature is off (patches.json / CLAWGOD_FEATURE_BUN_ANT_SHIM).
+require('./bun-ant-shim.cjs');
 
 require('./cli.original.cjs');

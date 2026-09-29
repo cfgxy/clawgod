@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { healSkillTemplates } from './skill-entry-guard.cjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = `${here}/cli.original.js`;
@@ -69,6 +70,19 @@ if (isChunked) {
     writeFileSync(fp, fc);
     n++;
   }
+  // Neutralize unguarded top-level entry code in the extracted skill
+  // templates (see skill-entry-guard.cjs). Graph installs release them as
+  // real files that claude's skill-file manifest requires in-process at
+  // startup; unguarded, their argv parsing exits 2 and kills the whole CLI
+  // (the "unknown argument: -p" crash). Direct execution is unaffected:
+  // import.meta.main holds when the file is run as a program (verified on
+  // node v22 / bun 1.3). Failures are reported, never fatal here - the
+  // launcher-side hazard scan decides at startup.
+  const segReport = healSkillTemplates(bunfsDir, { logFile: join(here, 'skill-entry-guard.log') });
+  for (const f of segReport.fixed) console.log(`skill-template guarded: ${f}`);
+  for (const f of segReport.alreadyGuarded) console.log(`skill-template already guarded: ${f}`);
+  for (const s of segReport.unmatched) console.log(`skill-template NOT guarded (${s.reason}): ${s.file}`);
+
   console.log(`cli.original.cjs: ${code.length} bytes (chunked, rewrote ${n} graph files)`);
 } else {
   // ── Legacy single-bundle path ──
