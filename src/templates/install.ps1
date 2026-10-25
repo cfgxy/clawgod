@@ -76,7 +76,7 @@ if ($Uninstall) {
         Write-OK "Removed clawgod alias"
     }
 
-    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","source-backup.json","patch.js","patch.mjs","ast-patches.mjs","acorn.mjs","acorn.LICENSE","extract-natives.mjs","post-process.mjs","repatch.mjs","startup-check.cjs","startup-check.log","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","bun-ant-shim.cjs","clawgod-import.exe","claude.staged.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","source-backup.json","patch.js","patch.mjs","ast-patches.mjs","acorn.mjs","acorn.LICENSE","extract-natives.mjs","post-process.mjs","repatch.mjs","startup-check.cjs","startup-check.log","openai-proxy.cjs","feature-gates.cjs","runtime-helpers.cjs","skill-entry-guard.cjs","bun-ant-shim.cjs","clawgod-import.exe","claude.staged.exe",".source-version","node_modules","bun-runtime","vendor","bunfs","pathmap.json")) {
         $p = Join-Path $ClawDir $f
         if (Test-Path $p) { Remove-Item -Recurse -Force $p }
     }
@@ -218,6 +218,19 @@ catch {
     Write-Err "  Re-run this script after installing rg."
     exit 1
 }
+
+# --- Write skill-template entry guard ----------------------------------
+# Must land on disk BEFORE post-process.mjs runs: post-process imports it at
+# module top to heal fresh graph installs, and cli.cjs requires it on every
+# launch. Written unconditionally so both the fresh-install and the
+# -NoUpgrade paths refresh it.
+
+New-Item -ItemType Directory -Force -Path $ClawDir | Out-Null
+
+@'
+{{CLAWGOD:skill-entry-guard.cjs}}
+'@ | Set-Content (Join-Path $ClawDir "skill-entry-guard.cjs") -Encoding UTF8
+Write-OK "Skill-template entry guard created (skill-entry-guard.cjs)"
 
 # --- Handle -NoUpgrade (re-patch the installed version) --------------
 if ($NoUpgrade) {

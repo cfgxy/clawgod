@@ -19,6 +19,21 @@
 // cli.original.cjs. Their gate lands in the same __clawgodPatches table.
 var CLAWGOD_RUNTIME_FEATURES = ['bun-ant-shim'];
 
+// The META constant above is woven in by build.js at release time. Install
+// states where it is missing — wrappers hand-copied onto older installs, or
+// releases built before the weave existed — used to die right here with a
+// bare ReferenceError that took the whole CLI down at startup. Degrade
+// instead: no META means no baked-patch gating, so every patch gate defaults
+// ON (the documented pre-toggle behavior) and the user gets one loud hint to
+// reinstall.
+var CLAWGOD_FEATURES_META_BAKED = null;
+try {
+  CLAWGOD_FEATURES_META_BAKED = CLAWGOD_FEATURES_META;
+} catch (_metaMissing) {
+  process.stderr.write('[clawgod] warning: CLAWGOD_FEATURES_META is missing from this install (legacy or hand-assembled layout); patch gates default ON. Reinstall clawgod to restore feature gating.\n');
+}
+var CLAWGOD_FEATURES_META_GATES = CLAWGOD_FEATURES_META_BAKED || {};
+
 var clawgodDir = require('path').join(require('os').homedir(), '.clawgod');
 
 var _cfg = {};
@@ -32,18 +47,22 @@ for (var _name in process.env) {
 
 // META keys are patch ids; a feature id is "known" when some patch lists it
 // or when the wrapper owns it (CLAWGOD_RUNTIME_FEATURES).
-// Unknown keys are residue (renamed/removed features).
-for (var _k in _cfg) {
-  var _known = CLAWGOD_RUNTIME_FEATURES.indexOf(_k) >= 0;
-  for (var _f in CLAWGOD_FEATURES_META) {
-    if (CLAWGOD_FEATURES_META[_f].indexOf(_k) >= 0) { _known = true; break; }
+// Unknown keys are residue (renamed/removed features). Without the woven
+// META there is nothing to validate against, so residue stays silent — the
+// missing-META warning above already covers that state.
+if (CLAWGOD_FEATURES_META_BAKED !== null) {
+  for (var _k in _cfg) {
+    var _known = CLAWGOD_RUNTIME_FEATURES.indexOf(_k) >= 0;
+    for (var _f in CLAWGOD_FEATURES_META_BAKED) {
+      if (CLAWGOD_FEATURES_META_BAKED[_f].indexOf(_k) >= 0) { _known = true; break; }
+    }
+    if (!_known) process.stderr.write('[clawgod] warning: unknown feature "' + _k + '" in patches.json\n');
   }
-  if (!_known) process.stderr.write('[clawgod] warning: unknown feature "' + _k + '" in patches.json\n');
 }
 
 var _gate = {};
-for (var _pid in CLAWGOD_FEATURES_META) {
-  var _feats = CLAWGOD_FEATURES_META[_pid];
+for (var _pid in CLAWGOD_FEATURES_META_GATES) {
+  var _feats = CLAWGOD_FEATURES_META_GATES[_pid];
   var _on = false;
   for (var _j = 0; _j < _feats.length; _j++) {
     if (_cfg[_feats[_j]] !== false) { _on = true; break; }

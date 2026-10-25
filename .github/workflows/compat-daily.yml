@@ -56,6 +56,12 @@ jobs:
       - name: Run patch semantic tests
         run: node src/shared/patch.test.mjs
 
+      - name: Run skill-entry-guard tests
+        run: node src/shared/skill-entry-guard.test.mjs
+
+      - name: Run installer wiring regression tests
+        run: node src/shared/installer-wiring.test.mjs
+
       - name: Run clean source and repatch regression tests
         run: node src/shared/source-backup.test.mjs
 

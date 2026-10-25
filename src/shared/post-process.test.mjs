@@ -16,6 +16,7 @@ try {
     const dir = join(root, mount.startsWith('B:') ? 'windows' : 'posix', 'profile space \u6d4b\u8bd5');
     mkdirSync(join(dir, 'bunfs'), { recursive: true });
     copyFileSync(new URL('./post-process.mjs', import.meta.url), join(dir, 'post-process.mjs'));
+    copyFileSync(new URL('./skill-entry-guard.cjs', import.meta.url), join(dir, 'skill-entry-guard.cjs'));
     writeFileSync(join(dir, 'pathmap.json'), JSON.stringify({
       [`${mount}helper.js`]: 'bunfs/helper.js',
       [`${mount}state-library.js.txt`]: 'bunfs/state-library.js.txt',

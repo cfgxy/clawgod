@@ -45,6 +45,7 @@ NC='\033[0m'
 
 info()  { echo -e "  ${GREEN}✓${NC} $1"; }
 warn()  { echo -e "  ${RED}✗${NC} $1"; }
+err()   { echo -e "  ${RED}✗${NC} $1" >&2; }
 dim()   { echo -e "  ${DIM}$1${NC}"; }
 
 echo ""
@@ -72,7 +73,7 @@ if [ "$UNINSTALL" = "1" ]; then
       info "Removed ClawGod alias ($DIR/clawgod)"
     fi
   done
-  rm -rf "$CLAWGOD_DIR/node_modules" "$CLAWGOD_DIR/vendor" "$CLAWGOD_DIR/bun-runtime" "$CLAWGOD_DIR/cli.original.js" "$CLAWGOD_DIR/cli.original.js.bak" "$CLAWGOD_DIR/cli.original.cjs" "$CLAWGOD_DIR/cli.original.cjs.bak" "$CLAWGOD_DIR/source-backup.json" "$CLAWGOD_DIR/cli.js" "$CLAWGOD_DIR/cli.cjs" "$CLAWGOD_DIR/patch.mjs" "$CLAWGOD_DIR/ast-patches.mjs" "$CLAWGOD_DIR/acorn.mjs" "$CLAWGOD_DIR/acorn.LICENSE" "$CLAWGOD_DIR/patch.js" "$CLAWGOD_DIR/extract-natives.mjs" "$CLAWGOD_DIR/post-process.mjs" "$CLAWGOD_DIR/repatch.mjs" "$CLAWGOD_DIR/startup-check.cjs" "$CLAWGOD_DIR/startup-check.log" "$CLAWGOD_DIR/openai-proxy.cjs" "$CLAWGOD_DIR/feature-gates.cjs" "$CLAWGOD_DIR/runtime-helpers.cjs" "$CLAWGOD_DIR/bun-ant-shim.cjs" "$CLAWGOD_DIR/clawgod-import" "$CLAWGOD_DIR/claude.staged" "$CLAWGOD_DIR/.source-version"
+  rm -rf "$CLAWGOD_DIR/node_modules" "$CLAWGOD_DIR/vendor" "$CLAWGOD_DIR/bun-runtime" "$CLAWGOD_DIR/cli.original.js" "$CLAWGOD_DIR/cli.original.js.bak" "$CLAWGOD_DIR/cli.original.cjs" "$CLAWGOD_DIR/cli.original.cjs.bak" "$CLAWGOD_DIR/source-backup.json" "$CLAWGOD_DIR/cli.js" "$CLAWGOD_DIR/cli.cjs" "$CLAWGOD_DIR/patch.mjs" "$CLAWGOD_DIR/ast-patches.mjs" "$CLAWGOD_DIR/acorn.mjs" "$CLAWGOD_DIR/acorn.LICENSE" "$CLAWGOD_DIR/patch.js" "$CLAWGOD_DIR/extract-natives.mjs" "$CLAWGOD_DIR/post-process.mjs" "$CLAWGOD_DIR/repatch.mjs" "$CLAWGOD_DIR/startup-check.cjs" "$CLAWGOD_DIR/startup-check.log" "$CLAWGOD_DIR/openai-proxy.cjs" "$CLAWGOD_DIR/feature-gates.cjs" "$CLAWGOD_DIR/runtime-helpers.cjs" "$CLAWGOD_DIR/skill-entry-guard.cjs" "$CLAWGOD_DIR/bun-ant-shim.cjs" "$CLAWGOD_DIR/clawgod-import" "$CLAWGOD_DIR/claude.staged" "$CLAWGOD_DIR/.source-version"
   hash -r 2>/dev/null
   info "ClawGod uninstalled"
   echo ""
@@ -165,6 +166,434 @@ info "ripgrep: $(rg --version | head -1)"
 
 # ─── Handle --no-upgrade (re-patch the installed version) ───────────
 mkdir -p "$CLAWGOD_DIR" "$BIN_DIR"
+
+# ─── Write skill-template entry guard ──────────────────
+# Must land on disk BEFORE post-process.mjs runs: post-process imports it at
+# module top to heal fresh graph installs, and cli.cjs requires it on every
+# launch. Written unconditionally so both the fresh-install and the
+# --no-upgrade paths refresh it.
+
+cat > "$CLAWGOD_DIR/skill-entry-guard.cjs" << 'CFG_EOF'
+'use strict';
+// Skill-template entry guard for graph installs.
+//
+// Failure mechanism (verified against a live 2.1.270 graph install): in a
+// graph install the bundled skill templates (the eval-hillclimb
+// `runner-scaffold` and `build-report-lite` scripts) are extracted to real
+// files under <install>/bunfs. Claude Code's skill-file manifest chunk (a
+// minified `chunk-*.js` module) executes `Re("<install>/bunfs/xxx.mjs")` at
+// module top level, where `Re = import.meta.require` - Bun's require - so
+// the template is evaluated IN-PROCESS while the CLI starts. A template
+// without an entry guard then parses the *host CLI's* argv (it reads
+// process.argv.slice(2), which is the CLI's argv, not a shell command): on
+// a headless `-p ...` invocation its arg parser prints
+// "unknown argument: -p" and calls process.exit(2), killing the whole CLI
+// before the session starts. The crash is intermittent because the
+// manifest chunk loads lazily - only sessions that touch the skill file
+// table pull it in.
+//
+// Fix (entry neutralization): the templates are only meant to be executed
+// directly (`node run-eval.mjs ...` / `node build-report-lite.mjs ...`), so
+// their top-level entry is wrapped in `if (import.meta.main)`: direct
+// execution still runs, and an in-process require()/import() becomes an
+// inert module load instead of an argv-parsing exit(2). import.meta.main
+// was verified on node v22.22.3 and bun 1.3.14 (true when the file is the
+// executed program, false under require()/import() on both).
+//
+// Scan (fail-fast): bunfs/*.mjs files are also scanned for the same hazard
+// shapes in templates we do not know by name (future upstream templates).
+// A hit aborts the CLI with an explicit launcher error naming the file,
+// instead of the cryptic mid-startup "unknown argument: -p" death.
+//
+// The two hazard shapes covered by the scan predicate:
+//   1. unguarded top-level entry call - the last code statement of the file
+//      is a bare `name();` where `name` is declared in the file (the
+//      runner-scaffold shape: unconditional trailing main()).
+//   2. top-level bare execution body - code at brace depth 0 reads
+//      process.argv or calls process.exit (the build-report-lite shape:
+//      trailing argv handling and try/catch at top level).
+
+const {
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} = require('fs');
+const { join } = require('path');
+const { appendFileSync } = require('fs');
+
+// Canonical guard written by the neutralizer. Its presence also marks a
+// file as already guarded (idempotent re-runs skip it).
+const GUARD_OPEN = 'if (import.meta.main) {';
+const GUARD_LINE = 'if (import.meta.main)';
+
+const KNOWN_TEMPLATES = [
+  {
+    name: 'runner-scaffold',
+    filePrefix: 'runner-scaffold-',
+    kind: 'trailing-entry-call',
+    // sanity: the file really declares the entry being neutralized
+    declarationRe: /\b(?:async\s+)?function\s+main\s*\(/,
+  },
+  {
+    name: 'build-report-lite',
+    filePrefix: 'build-report-lite-',
+    kind: 'tail-body',
+    bodyAnchor: 'const arg = process.argv[2];',
+    declarationRe: /\bfunction\s+build\s*\(/,
+  },
+];
+
+// ─── Lite tokenizer ─────────────────────────────────────────────
+// Blank out comments, string/template/regex literal CONTENTS (spaces,
+// newlines kept) so brace depth and line structure of the real code
+// survive. Output length always equals input length. Handles // and
+// /* */ comments, '...' and "..." strings with escapes, `...` template
+// literals with ${...} interpolations (recursively tokenized), /regex/
+// literals via the previous-significant-token heuristic, and the #!
+// shebang line. Regex detection is a heuristic; a misparse can only move
+// the depth estimate, and the scan predicates below are shaped so that a
+// stale depth fails toward flagging (clear error) rather than staying
+// silent on a real hazard.
+
+function regexAllowed(prev, src, i) {
+  if (prev === '') return true;
+  if ('(,=:[!&|?{};+-*%~^<>'.includes(prev)) return true;
+  let j = i - 1;
+  let word = '';
+  while (j >= 0 && /[A-Za-z_$0-9]/.test(src[j])) {
+    word = src[j] + word;
+    j--;
+  }
+  return [
+    'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
+    'void', 'throw', 'case', 'do', 'else', 'yield', 'await',
+  ].includes(word);
+}
+
+function stripForScan(src) {
+  const out = src.split('');
+  const n = src.length;
+  const blank = (a, b) => {
+    for (let k = a; k < b; k++) if (out[k] !== '\n') out[k] = ' ';
+  };
+  let i = 0;
+  let prev = '';
+
+  if (src.startsWith('#!')) {
+    while (i < n && src[i] !== '\n') {
+      out[i] = ' ';
+      i++;
+    }
+  }
+
+  // Consumes template-literal text after an opening backtick. `${...}`
+  // interpolations stay visible (they are code) and recurse into code().
+  function templateText() {
+    while (i < n) {
+      const c = src[i];
+      if (c === '\\') {
+        if (out[i] !== '\n') out[i] = ' ';
+        if (i + 1 < n && out[i + 1] !== '\n') out[i + 1] = ' ';
+        i += 2;
+        continue;
+      }
+      if (c === '`') {
+        out[i] = ' ';
+        i++;
+        prev = '`';
+        return;
+      }
+      if (c === '$' && src[i + 1] === '{') {
+        i += 2;
+        code('}');
+        if (src[i] === '}') i++;
+        continue;
+      }
+      if (c !== '\n') out[i] = ' ';
+      i++;
+    }
+  }
+
+  // Consumes code until one of `stop` chars appears at this segment's
+  // brace depth 0 (leaves that char unconsumed). Empty `stop` = top level.
+  function code(stop) {
+    let depth = 0;
+    while (i < n) {
+      const c = src[i];
+      const d = src[i + 1];
+      if (c === '/' && d === '/') {
+        const s = i;
+        while (i < n && src[i] !== '\n') i++;
+        blank(s, i);
+        continue;
+      }
+      if (c === '/' && d === '*') {
+        const s = i;
+        i += 2;
+        while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
+        i = Math.min(n, i + 2);
+        blank(s, i);
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const s = i;
+        i++;
+        while (i < n && src[i] !== c) {
+          if (src[i] === '\\') i++;
+          i++;
+        }
+        i = Math.min(n, i + 1);
+        blank(s, i);
+        prev = '"';
+        continue;
+      }
+      if (c === '`') {
+        out[i] = ' ';
+        i++;
+        templateText();
+        continue;
+      }
+      if (c === '/' && d !== '/' && d !== '*' && regexAllowed(prev, src, i)) {
+        const s = i;
+        i++;
+        let inClass = false;
+        while (i < n) {
+          const r = src[i];
+          if (r === '\\') {
+            i += 2;
+            continue;
+          }
+          if (r === '\n') break;
+          if (r === '[') inClass = true;
+          else if (r === ']') inClass = false;
+          else if (r === '/' && !inClass) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        blank(s, i);
+        prev = '/';
+        continue;
+      }
+      if (stop && stop.includes(c) && depth === 0) return;
+      if (c === '{') depth++;
+      else if (c === '}') {
+        if (depth === 0) return;
+        depth--;
+      }
+      if (!/\s/.test(c)) prev = c;
+      i++;
+    }
+  }
+
+  code('');
+  return out.join('');
+}
+
+// Depth at the start of each line of already-stripped code.
+function lineStartDepths(stripped) {
+  const depths = [];
+  let depth = 0;
+  for (const line of stripped.split('\n')) {
+    depths.push(depth);
+    for (const ch of line) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+    }
+  }
+  return depths;
+}
+
+// Brace depth at a character offset of a stripped source. stripForScan
+// blanks every non-code character, so counting braces up to the offset is
+// exact — this is the authoritative "is this token at top level" test and
+// also answers tokens that merely share a line with a block opener.
+function depthAt(stripped, offset) {
+  let depth = 0;
+  for (let k = 0; k < offset; k++) {
+    const ch = stripped[k];
+    if (ch === '{') depth++;
+    else if (ch === '}') depth--;
+  }
+  return depth;
+}
+
+// ─── Fix B: hazard scan ─────────────────────────────────────────
+// Returns [{ file, form, line, detail }] for bunfs/*.mjs files whose
+// top-level code would execute on an in-process require(). Both shapes
+// from the module header are covered; anything inside function bodies,
+// behind the canonical guard, or inside comments/strings/regex/template
+// text is ignored.
+
+function scanText(content, fileName) {
+  const hits = [];
+  const stripped = stripForScan(content);
+  const lines = stripped.split('\n');
+  const depths = lineStartDepths(stripped);
+
+  let off = 0;
+  for (let li = 0; li < lines.length; li++) {
+    const raw = lines[li];
+    const t = raw.trim();
+    if (t && depths[li] === 0 && !t.startsWith(GUARD_LINE)
+        && (t.includes('process.argv') || t.includes('process.exit('))) {
+      // A top-level line may open a block before the match (`fn() { ... }`
+      // one-liners keep argv function-scoped); judge at the match itself.
+      const mi = raw.indexOf('process.argv');
+      const mj = raw.indexOf('process.exit(');
+      const at = mi === -1 ? mj : (mj === -1 ? mi : Math.min(mi, mj));
+      if (at !== -1 && depthAt(stripped, off + at) === 0) {
+        hits.push({
+          file: fileName,
+          form: 'top-level argv/exit (bare execution body)',
+          line: li + 1,
+          detail: t.slice(0, 100),
+        });
+      }
+    }
+    off += raw.length + 1;
+  }
+
+  // Shape 1: the final entry invokes a declared function directly, optionally
+  // chaining a promise rejection handler as runner-scaffold does.
+  for (let li = lines.length - 1; li >= 0; li--) {
+    const t = lines[li].trim();
+    if (!t) continue;
+    const m = /^([\w$]+)\(\);\s*;?$/.exec(t);
+    const catchMatch = fileName.startsWith('runner-scaffold-')
+      && /\nmain\(\)\.catch\([\s\S]*\);\s*$/.exec(stripped);
+    const catchEntry = catchMatch && depthAt(stripped, catchMatch.index + 1) === 0;
+    if ((m && depths[li] === 0) || catchEntry) {
+      const name = m ? m[1] : 'main';
+      const declRe = new RegExp(
+        '(?:^|\\n)[^\\n]*(?:\\bfunction\\s+' + name + '\\s*\\(|\\b(?:const|let|var)\\s+' + name + '\\s*=)',
+      );
+      if (declRe.test(stripped)) {
+        hits.push({
+          file: fileName,
+          form: 'unguarded top-level entry call',
+          line: catchEntry ? content.slice(0, content.lastIndexOf('\nmain().catch(')).split('\n').length + 1 : li + 1,
+          detail: catchEntry ? 'main().catch(...)' : t,
+        });
+      }
+    }
+    break;
+  }
+  return hits;
+}
+
+function scanSkillTemplateHazards(bunfsDir) {
+  const hits = [];
+  if (!existsSync(bunfsDir)) return hits;
+  for (const f of readdirSync(bunfsDir).sort()) {
+    if (!f.endsWith('.mjs')) continue;
+    let content;
+    try {
+      content = readFileSync(join(bunfsDir, f), 'utf8');
+    } catch {
+      continue;
+    }
+    hits.push(...scanText(content, f));
+  }
+  return hits;
+}
+
+// ─── Fix A: neutralize the known templates ──────────────────────
+// Idempotent. Writes a .clawgod-orig backup next to the file before the
+// first rewrite and appends an action line to logFile. Files whose shape
+// no longer matches are reported in `unmatched` and left untouched - the
+// hazard scan then decides at startup whether they are still dangerous.
+
+function appendGuardLog(logFile, action, detail) {
+  if (!logFile) return;
+  try {
+    appendFileSync(logFile, new Date().toISOString() + ' action=' + action
+      + ' ' + detail + '\n');
+  } catch {
+    /* forensics only - never block the caller */
+  }
+}
+
+function healSkillTemplates(bunfsDir, options) {
+  const logFile = (options && options.logFile) || '';
+  const report = { fixed: [], alreadyGuarded: [], unmatched: [], backups: [] };
+  if (!existsSync(bunfsDir)) return report;
+
+  for (const tpl of KNOWN_TEMPLATES) {
+    for (const f of readdirSync(bunfsDir).sort()) {
+      if (!f.startsWith(tpl.filePrefix) || !f.endsWith('.mjs')) continue;
+      const fp = join(bunfsDir, f);
+      let content;
+      try {
+        content = readFileSync(fp, 'utf8');
+      } catch (e) {
+        report.unmatched.push({ file: f, reason: 'unreadable: ' + (e && e.message || e) });
+        continue;
+      }
+      if (content.includes('import.meta.main')) {
+        report.alreadyGuarded.push(f);
+        continue;
+      }
+
+      let guarded;
+      if (tpl.kind === 'trailing-entry-call') {
+        const stripped = stripForScan(content);
+        const entry = /\nmain\(\)(?:\.catch\([\s\S]*\))?;\s*$/.exec(stripped);
+        if (!tpl.declarationRe.test(content) || !entry || depthAt(stripped, entry.index + 1) !== 0) {
+          report.unmatched.push({
+            file: f,
+            reason: 'trailing main() entry not found (template shape changed?)',
+          });
+          continue;
+        }
+        guarded = content.slice(0, entry.index) + '\n' + GUARD_LINE + ' ' + entry[0].slice(1);
+      } else {
+        const occurrences = content.split(tpl.bodyAnchor).length - 1;
+        if (occurrences !== 1 || !tpl.declarationRe.test(content)) {
+          report.unmatched.push({
+            file: f,
+            reason: 'single top-level `' + tpl.bodyAnchor + '` anchor not found (template shape changed?)',
+          });
+          continue;
+        }
+        const stripped = stripForScan(content);
+        const anchorOffset = stripped.indexOf(tpl.bodyAnchor);
+        if (depthAt(stripped, anchorOffset) !== 0) {
+          report.unmatched.push({ file: f, reason: 'body anchor is not at top level' });
+          continue;
+        }
+        guarded = content
+          .replace(tpl.bodyAnchor, GUARD_OPEN + '\n' + tpl.bodyAnchor)
+          .replace(/\s*$/, '\n}\n');
+      }
+
+      const backup = fp + '.clawgod-orig';
+      if (!existsSync(backup)) {
+        try {
+          copyFileSync(fp, backup);
+          report.backups.push(backup);
+        } catch {
+          /* best-effort */
+        }
+      }
+      try {
+        writeFileSync(fp, guarded);
+        report.fixed.push(f);
+        appendGuardLog(logFile, 'guarded', f);
+      } catch (e) {
+        report.unmatched.push({ file: f, reason: 'write failed: ' + (e && e.message || e) });
+      }
+    }
+  }
+  return report;
+}
+
+module.exports = { stripForScan, scanSkillTemplateHazards, healSkillTemplates, appendGuardLog };
+CFG_EOF
+info "Skill-template entry guard created (skill-entry-guard.cjs)"
 
 if [ "$NO_UPGRADE" = "1" ]; then
   if [ ! -f "$CLAWGOD_DIR/cli.original.cjs" ]; then
@@ -783,6 +1212,7 @@ cat > "$CLAWGOD_DIR/post-process.mjs" << 'POSTPROC_EOF'
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, realpathSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { healSkillTemplates } from './skill-entry-guard.cjs';
 
 // Generate paths in the OS's canonical form, including Windows 8.3 aliases.
 const here = realpathSync.native(dirname(fileURLToPath(import.meta.url)));
@@ -873,6 +1303,19 @@ if (isChunked) {
     writeFileSync(fp, fc);
     n++;
   }
+  // Neutralize unguarded top-level entry code in the extracted skill
+  // templates (see skill-entry-guard.cjs). Graph installs release them as
+  // real files that claude's skill-file manifest requires in-process at
+  // startup; unguarded, their argv parsing exits 2 and kills the whole CLI
+  // (the "unknown argument: -p" crash). Direct execution is unaffected:
+  // import.meta.main holds when the file is run as a program (verified on
+  // node v22 / bun 1.3). Failures are reported, never fatal here - the
+  // launcher-side hazard scan decides at startup.
+  const segReport = healSkillTemplates(bunfsDir, { logFile: join(here, 'skill-entry-guard.log') });
+  for (const f of segReport.fixed) console.log(`skill-template guarded: ${f}`);
+  for (const f of segReport.alreadyGuarded) console.log(`skill-template already guarded: ${f}`);
+  for (const s of segReport.unmatched) console.log(`skill-template NOT guarded (${s.reason}): ${s.file}`);
+
   console.log(`cli.original.cjs: ${code.length} bytes (chunked, rewrote ${n} graph files)`);
 } else {
   // ── Legacy single-bundle path ──
@@ -1462,6 +1905,21 @@ const CLAWGOD_FEATURES_META = {
 // cli.original.cjs. Their gate lands in the same __clawgodPatches table.
 var CLAWGOD_RUNTIME_FEATURES = ['bun-ant-shim'];
 
+// The META constant above is woven in by build.js at release time. Install
+// states where it is missing — wrappers hand-copied onto older installs, or
+// releases built before the weave existed — used to die right here with a
+// bare ReferenceError that took the whole CLI down at startup. Degrade
+// instead: no META means no baked-patch gating, so every patch gate defaults
+// ON (the documented pre-toggle behavior) and the user gets one loud hint to
+// reinstall.
+var CLAWGOD_FEATURES_META_BAKED = null;
+try {
+  CLAWGOD_FEATURES_META_BAKED = CLAWGOD_FEATURES_META;
+} catch (_metaMissing) {
+  process.stderr.write('[clawgod] warning: CLAWGOD_FEATURES_META is missing from this install (legacy or hand-assembled layout); patch gates default ON. Reinstall clawgod to restore feature gating.\n');
+}
+var CLAWGOD_FEATURES_META_GATES = CLAWGOD_FEATURES_META_BAKED || {};
+
 var clawgodDir = require('path').join(require('os').homedir(), '.clawgod');
 
 var _cfg = {};
@@ -1475,18 +1933,22 @@ for (var _name in process.env) {
 
 // META keys are patch ids; a feature id is "known" when some patch lists it
 // or when the wrapper owns it (CLAWGOD_RUNTIME_FEATURES).
-// Unknown keys are residue (renamed/removed features).
-for (var _k in _cfg) {
-  var _known = CLAWGOD_RUNTIME_FEATURES.indexOf(_k) >= 0;
-  for (var _f in CLAWGOD_FEATURES_META) {
-    if (CLAWGOD_FEATURES_META[_f].indexOf(_k) >= 0) { _known = true; break; }
+// Unknown keys are residue (renamed/removed features). Without the woven
+// META there is nothing to validate against, so residue stays silent — the
+// missing-META warning above already covers that state.
+if (CLAWGOD_FEATURES_META_BAKED !== null) {
+  for (var _k in _cfg) {
+    var _known = CLAWGOD_RUNTIME_FEATURES.indexOf(_k) >= 0;
+    for (var _f in CLAWGOD_FEATURES_META_BAKED) {
+      if (CLAWGOD_FEATURES_META_BAKED[_f].indexOf(_k) >= 0) { _known = true; break; }
+    }
+    if (!_known) process.stderr.write('[clawgod] warning: unknown feature "' + _k + '" in patches.json\n');
   }
-  if (!_known) process.stderr.write('[clawgod] warning: unknown feature "' + _k + '" in patches.json\n');
 }
 
 var _gate = {};
-for (var _pid in CLAWGOD_FEATURES_META) {
-  var _feats = CLAWGOD_FEATURES_META[_pid];
+for (var _pid in CLAWGOD_FEATURES_META_GATES) {
+  var _feats = CLAWGOD_FEATURES_META_GATES[_pid];
   var _on = false;
   for (var _j = 0; _j < _feats.length; _j++) {
     if (_cfg[_feats[_j]] !== false) { _on = true; break; }
@@ -1761,6 +2223,48 @@ require('./feature-gates.cjs');
 // see runtime-helpers.cjs). cli.original.cjs is a separate module scope, so
 // the patched bundle reaches helpers through globalThis only.
 require('./runtime-helpers.cjs');
+
+// Skill-template entry guard (see skill-entry-guard.cjs): in graph installs
+// the bundled skill templates (runner-scaffold / build-report-lite) are
+// extracted to real files under bunfs/, and claude's skill-file manifest
+// chunk evaluates them IN-PROCESS via import.meta.require() when a session
+// touches the skill table. An unguarded template then parses the host CLI's
+// argv and exits 2 on headless `-p` flags, killing the session before it
+// starts (the "unknown argument: -p" crash; intermittent because the
+// manifest chunk loads lazily). Heal the known templates idempotently
+// (.clawgod-orig backup + skill-entry-guard.log), then fail fast with an
+// explicit launcher error if any bunfs/*.mjs still carries unguarded
+// top-level entry code. Graph installs only: the legacy single-bundle keeps
+// the assets inside cli.original.cjs where they cannot be required.
+try {
+  const _segBunfsDir = join(clawgodDir, 'bunfs');
+  if (existsSync(_segBunfsDir)) {
+    const _seg = require('./skill-entry-guard.cjs');
+    const _segLog = join(clawgodDir, 'skill-entry-guard.log');
+    const _segReport = _seg.healSkillTemplates(_segBunfsDir, { logFile: _segLog });
+    for (const _u of _segReport.unmatched) {
+      process.stderr.write('[clawgod] skill-entry-guard: could not guard ' + _u.file + ' (' + _u.reason + ')\n');
+    }
+    const _segHits = _seg.scanSkillTemplateHazards(_segBunfsDir);
+    if (_segHits.length > 0) {
+      const _out = ['[clawgod] FATAL: unguarded skill template(s) in graph install.',
+        "[clawgod] Their top-level code runs in-process when claude's skill manifest",
+        '[clawgod] requires them at startup and can exit the whole CLI (the',
+        '[clawgod] "unknown argument: -p" startup crash):'];
+      for (const _h of _segHits) {
+        _out.push('[clawgod]   ' + _h.file + ' (line ' + _h.line + ', ' + _h.form + ')');
+      }
+      _out.push('[clawgod] Fix: re-run the clawgod installer to regenerate guarded templates, or');
+      _out.push("[clawgod] hand-wrap the file's top-level entry in `if (import.meta.main) { ... }`.");
+      process.stderr.write(_out.join('\n') + '\n');
+      try { _seg.appendGuardLog(_segLog, 'fatal', _segHits.map((_h) => _h.file + ':' + _h.line).join(', ')); } catch {}
+      process.exit(1);
+    }
+  }
+} catch (_segErr) {
+  // best-effort: a defect here must never brick the CLI - warn loudly instead
+  process.stderr.write('[clawgod] skill-entry-guard skipped: ' + ((_segErr && _segErr.message) || _segErr) + '\n');
+}
 
 // Claude Code 2.1.271+ renders through Bun.ant.CellSegmenter, an
 // Anthropic-private Bun API that stock Bun does not ship. Without it the
