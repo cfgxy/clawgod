@@ -3,12 +3,16 @@ import { parse } from './acorn.mjs';
 export const AST_PATCH_IDS = [
   'user-type-ant', 'bun-standalone-executable', 'growthbook-env-overrides-graph',
   'computer-use-default', 'ultraplan', 'voice-mode',
-  'geo-stego-date', 'remote-settings-off', 'wiggly-dove',
+  'geo-stego-date', 'remote-settings-off', 'wiggly-dove', 'compact-summary-sanitize',
 ];
 
+const COMPACT_HEADER = 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.';
+const COMPACT_CONTINUATION = 'Continue the conversation from where it left off without asking the user any further questions.';
+const COMPACT_INTERNAL_MARKER = 'CRITICAL: Respond with TEXT ONLY';
 const anchors = ['external', 'isStandaloneExecutable', 'environmentOverridesParsed',
   'pixelValidation', 'ultraplan', 'tengu_amber_quartz_disabled', 's date is ',
-  'Remote settings:', 'remote-settings.json', 'tengu_wiggly_dove'];
+  'Remote settings:', 'remote-settings.json', 'tengu_wiggly_dove',
+  COMPACT_HEADER, COMPACT_CONTINUATION];
 const gate = id => `globalThis.__clawgodPatches?.[${JSON.stringify(id)}]!==!1`;
 const literal = (node, value) => node?.type === 'Literal' && node.value === value;
 const propertyName = node => node.computed
@@ -21,6 +25,8 @@ const boolean = (node, value) => literal(node, value) ||
   (node?.type === 'UnaryExpression' && node.operator === '!' && literal(node.argument, value ? 0 : 1));
 const isUndefined = node => node?.type === 'UnaryExpression' && node.operator === 'void' &&
   literal(node.argument, 0);
+const stringValues = node => node?.type === 'Literal' && typeof node.value === 'string' ? [node.value]
+  : node?.type === 'TemplateLiteral' ? node.quasis.map(quasi => quasi.value.cooked ?? '') : [];
 
 export const parsePatchSource = code => parse(code, {
   ecmaVersion: 'latest', sourceType: 'script', allowHashBang: true,
@@ -92,11 +98,14 @@ export function scanAstPatches(code) {
   // not a minified name or the common cache/`{eligible}` prefix. Keep this
   // local to one chunk: cross-chunk imports are not a stable contract.
   const functions = new Map();
+  const compactHeaderBindings = new Set();
   const wigglyLiterals = new Set(), wigglyHandled = new Set();
   walk(tree, node => {
     if (node.type === 'FunctionDeclaration' && node.id?.type === 'Identifier') {
       functions.set(node.id.name, node);
     }
+    if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' &&
+        literal(node.init, COMPACT_HEADER)) compactHeaderBindings.add(node.id.name);
   });
   walk(tree, node => {
     if (literal(node, 'tengu_wiggly_dove')) wigglyLiterals.add(node.start);
@@ -245,6 +254,83 @@ export function scanAstPatches(code) {
         if (readsOverrides) edit('growthbook-env-overrides-graph', statement,
           `${code.slice(assignment.start, assignment.end)};`);
       }
+    }
+
+    if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type) &&
+        node.params.length >= 1 && node.params[0].type === 'Identifier' && node.body?.type === 'BlockStatement') {
+      const id = 'compact-summary-sanitize';
+      const strings = [];
+      const templates = [];
+      walk(node.body, child => {
+        strings.push(...stringValues(child));
+        if (child.type === 'TemplateLiteral') templates.push(child);
+      });
+      const isContinuationBuilder = strings.some(value => value.includes(COMPACT_CONTINUATION));
+      if (!isContinuationBuilder) return;
+
+      const contentBindings = new Set();
+      walk(node.body, child => {
+        if (child.type !== 'ObjectExpression') return;
+        for (const property of child.properties) {
+          if (property.type === 'Property' && propertyName(property) === 'content' &&
+              property.value.type === 'Identifier') contentBindings.add(property.value.name);
+        }
+      });
+      const templateBindings = new Map(node.body.body.filter(statement =>
+        statement.type === 'VariableDeclaration').flatMap(statement => statement.declarations)
+        .filter(declaration => declaration.id.type === 'Identifier' &&
+          declaration.init?.type === 'TemplateLiteral').map(declaration =>
+          [declaration.init.start, declaration.id.name]));
+      const headerTemplates = templates.filter(template => {
+        if (!contentBindings.has(templateBindings.get(template.start))) return false;
+        const localHeader = template.expressions.some(expression =>
+          expression.type === 'Identifier' && compactHeaderBindings.has(expression.name));
+        // The graph bundle imports the header from a sibling chunk. Its message
+        // body ends with the summarized input and has a distinct header binding.
+        const importedHeader = template.expressions.at(-1)?.type === 'Identifier' &&
+          template.quasis.at(-1)?.value.cooked === '' &&
+          template.quasis.some(quasi => quasi.value.cooked?.includes('\n\n')) &&
+          template.expressions.slice(0, -1).some(expression => expression.type === 'Identifier');
+        return localHeader || importedHeader;
+      });
+      if (headerTemplates.length !== 1) {
+        results[id].present = true;
+        return;
+      }
+
+      const summaryReferences = new Set(headerTemplates[0].expressions
+        .filter(expression => expression.type === 'Identifier').map(expression => expression.name));
+      const isSummaryExpression = expression => {
+        const inputCalls = [];
+        walk(expression, child => {
+          if (child.type === 'CallExpression' && child.callee.type === 'Identifier' &&
+              child.arguments.length === 1 && child.arguments[0].type === 'Identifier' &&
+              child.arguments[0].name === node.params[0].name) inputCalls.push(child);
+        });
+        return inputCalls.length === 1;
+      };
+      const summaries = node.body.body.filter(statement => statement.type === 'VariableDeclaration')
+        .flatMap(statement => statement.declarations).filter(declaration =>
+          declaration.id.type === 'Identifier' && summaryReferences.has(declaration.id.name) &&
+          declaration.init && isSummaryExpression(declaration.init));
+      if (summaries.length !== 1) {
+        results[id].present = true;
+        return;
+      }
+      const summary = summaries[0];
+      const summarySource = code.slice(summary.init.start, summary.init.end);
+      const existingSanitizer = summary.init.type === 'CallExpression' &&
+        member(summary.init.callee, 'trim') &&
+        summarySource.includes(COMPACT_INTERNAL_MARKER);
+      if (existingSanitizer) {
+        results[id].patched = true;
+        return;
+      }
+      const original = code.slice(summary.init.start, summary.init.end);
+      // The compactor's own no-tools prompt is valid only while creating the
+      // summary. Drop quoted copies before the summary becomes a user message.
+      const sanitize = `(${original}).replace(/(?:^|\\n)[^\\n]*(?:(?:(?:latest|most recent)\\s+)?user\\s+(?:message|request)|(?:本次)?最新?用户(?:消息|要求))[^\\n]*\\n\\s*(?:>\\s*)?["“”]?\\s*CRITICAL: Respond with TEXT ONLY\\. Do NOT call any tools\\.\\s*["“”]?(?:\\n\\s*(?:>\\s*)?["“”]?\\s*Your entire response must be plain text:[^\\n]*["“”]?)?/giu,"").replace(/(?:^|\\n)[^\\n]*CRITICAL: Respond with TEXT ONLY\\. Do NOT call any tools\\.[^\\n]*(?:\\n\\s*(?:>\\s*)?["“”]?\\s*Your entire response must be plain text:[^\\n]*["“”]?)?/gu,"").replace(/(?:^|\\n)\\s*(?:>\\s*)?["“”]?\\s*Your entire response must be plain text:[^\\n]*/gu,"").replace(/\\n{3,}/g,"\\n\\n").trim()`;
+      edit(id, summary.init, sanitize);
     }
   });
   if ([...wigglyLiterals].some(start => !wigglyHandled.has(start))) {

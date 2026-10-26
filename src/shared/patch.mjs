@@ -752,6 +752,16 @@ const patches = [
     name: 'Ignore enterprise-managed remote settings',
     ast: true,
   },
+  {
+    // Claude Code replays compaction output as a synthetic user message. The
+    // compactor-only no-tools preamble must never survive that boundary: model
+    // summaries have incorrectly restated it as the latest user instruction.
+    // The AST matcher anchors the continuation header, its resume guidance and
+    // the formatted-summary interpolation, then sanitizes only that value.
+    id: 'compact-summary-sanitize',
+    name: 'Remove compactor-only no-tools instructions from resumed summaries',
+    ast: true,
+  },
 ];
 
 // ─── Main ─────────────────────────────────────────────────
