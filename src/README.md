@@ -17,7 +17,7 @@ when either generated installer is missing or differs from its sources.
 The patcher uses Acorn AST nodes for `user-type-ant`,
 `bun-standalone-executable`, `growthbook-env-overrides-graph`,
 `computer-use-default`, `ultraplan`, `voice-mode`, `geo-stego-date`,
-`remote-settings-off`, and `wiggly-dove`.
+`remote-settings-off`, `wiggly-dove`, and `compact-summary-sanitize`.
 It parses each candidate file once, locates stable property/string names and grammar nodes, and splices
 only those node ranges. Metadata order, quote style, whitespace, and supported
 function forms do not determine the location. Comments and text inside strings
