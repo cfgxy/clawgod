@@ -17,12 +17,18 @@ when either generated installer is missing or differs from its sources.
 The patcher uses Acorn AST nodes for `user-type-ant`,
 `bun-standalone-executable`, `growthbook-env-overrides-graph`,
 `computer-use-default`, `ultraplan`, `voice-mode`, `geo-stego-date`,
-`remote-settings-off`, `wiggly-dove`, and `compact-summary-sanitize`.
+`remote-settings-off`, `wiggly-dove`, `compact-summary-provenance-v2`, and
+`synthetic-continuation-provenance-v1`.
 It parses each candidate file once, locates stable property/string names and grammar nodes, and splices
 only those node ranges. Metadata order, quote style, whitespace, and supported
 function forms do not determine the location. Comments and text inside strings
-are not patch sites. The remaining patches retain their existing regex matchers;
-this is an incremental migration, with no new feature unlocks.
+are not patch sites. Compact summaries use `compact-summary-provenance-v2`:
+the internal request is versioned and marked as metadata, full/partial/reactive
+outputs carry their source, persisted `isCompactSummary` rows are rechecked on
+resume, and runner/interrupted/cross-machine synthetic rows carry explicit
+provenance. A graph-wide preflight refuses partial producer/consumer patches.
+The remaining patches retain their existing regex matchers; this is an
+incremental migration, with no new feature unlocks.
 
 AST edits are checked for overlap and reparsed before the regex phase. Parse
 failures abort without writing runtime source, even with `--tolerate-stale`.
@@ -47,6 +53,11 @@ reordering, quoted/computed keys, function forms, directive preservation,
 unchanged neighboring code, runtime toggles, repeated patching, dry-run/verify,
 clean-source restoration, stale policy, and syntax-failure safety in both legacy
 and chunk layouts. CI runs this suite alongside the existing patch tests.
+
+`node src/shared/compact-summary.test.mjs` checks versioned wrapper removal,
+quoted/listed internal stanzas, preservation of a real user's identical text,
+semantic paraphrase quarantine, incomplete-boundary quarantine, and
+untrusted-provenance preservation.
 
 `src/shared/patch.test.mjs` tests the classifier-timeout helper in
 `runtime-helpers.cjs` and runs the patcher on Ultraplan fixtures for legacy

@@ -4,7 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
-import { AST_PATCH_IDS, scanAstPatches, applyAstEdits, parsePatchSource } from './ast-patches.mjs';
+import {
+  AST_PATCH_IDS,
+  scanAstPatches,
+  applyAstEdits,
+  parsePatchSource,
+  validateContinuationGraph,
+} from './ast-patches.mjs';
+import { sanitizeCompactSummaryV1 } from './runtime-helpers.cjs';
 
 const source = `
 // function userType(){return"external"} name:"ultraplan"
@@ -31,7 +38,8 @@ const unrelated={method(){return this.environmentOverridesParsed=true,this.envir
 const dateSource = 'function dateText (input) {let info=probe(),mark=apostrophe(info?.known??false,info?.labKw??false),formatted=info?.cnTZ?input.replaceAll("-","/"):input;return`Today${mark}s date is ${formatted}.`}';
 const scanned = scanAstPatches(source + dateSource);
 for (const id of AST_PATCH_IDS) assert.equal(scanned[id].matches.length,
-  ['remote-settings-off', 'wiggly-dove', 'compact-summary-sanitize'].includes(id) ? 0 : 1, id);
+  ['remote-settings-off', 'wiggly-dove', 'compact-summary-provenance-v2',
+    'synthetic-continuation-provenance-v1'].includes(id) ? 0 : 1, id);
 const edits = Object.values(scanned).flatMap(result => result.matches);
 const patched = applyAstEdits(source + dateSource, edits);
 parsePatchSource(patched);
@@ -58,62 +66,61 @@ for (const toggle of [undefined, true, false]) {
 assert.equal(applyAstEdits(patched, Object.values(scanAstPatches(patched)).flatMap(r => r.matches)), patched,
   'repeated patching without a snapshot must not nest gates');
 
-// Compaction output becomes a synthetic user message. The no-tools prompt is
-// valid while generating that output, but must not reappear as a user request
-// when Claude resumes work. Match the continuation builder semantically and
-// preserve both the useful summary and the resume guidance.
+// The three summary producers, the persisted resume boundary, and the two
+// synthetic continuation producers must be patched as one provenance contract.
 const compactSource = `
 const compactHeader='This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.';
-function formatSummary(raw){return raw.trim()}
-function continuationMessage(raw,options){
-  let summary=formatSummary(raw),modelOnlyText,content=\`${'${compactHeader}'}\\n\\n${'${summary}'}\`;
-  if(options?.suppressFollowUpQuestions)return{content:\`${'${content}'}\\nContinue the conversation from where it left off without asking the user any further questions. Pick up the last task as if the break never happened.\`,...modelOnlyText!==void 0&&{modelOnlyText}};
-  return{content};
-}
+const resumeHint='Continue the conversation from where it left off without asking the user any further questions.';
+function Ben(e){return 'REMINDER: Do NOT call any tools. '+e}
+function Uen(e,n){let s='CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.';return s+=Ben('plain text'),s}
+function NJ(e,n,r){let y='CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.';return y+=Ben('plain text'),y}
+function $J(raw){return raw}
+function Ie(value){return value}
+function aHe(){return [
+  {type:'user',isCompactSummary:!0,message:{content:'Before\\nCRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\\nREMINDER: Do NOT call any tools.\\nAfter'}},
+  {type:'user',isCompactSummary:!0,message:{content:'Before\\nTool calls will be REJECTED and no tools should be used.'}}
+]}
+function _Nr(raw){let dt=Ie({content:'request'});return [Ie({...$J(raw),isCompactSummary:!0})]}
+function yWs(raw){let gt=Ie({content:'request'});return [Ie({...$J(raw),isCompactSummary:!0})]}
+function Ken(raw){let Ae=Ie({content:'request'});return [Ie({...$J(raw),isCompactSummary:!0})]}
+function FHr(){return 'Continue from where you left off.'}
+function aQt(){let Qe=aHe([]);let row=Ie({content:FHr(),isMeta:!0});return Qe}
+function e7o(){return Ie({content:'This session is being continued from another machine.',isMeta:!0})}
 `;
-const compactScan = scanAstPatches(compactSource)['compact-summary-sanitize'];
-assert.equal(compactScan.present, false);
-assert.equal(compactScan.matches.length, 1);
-const compactPatched = applyAstEdits(compactSource, compactScan.matches);
+const compactResults = scanAstPatches(compactSource);
+const compactScan = compactResults['compact-summary-provenance-v2'];
+const syntheticScan = compactResults['synthetic-continuation-provenance-v1'];
+assert.equal(compactScan.matches.length, 12);
+assert.equal(syntheticScan.matches.length, 2);
+const compactPatched = applyAstEdits(compactSource,
+  [...compactScan.matches, ...syntheticScan.matches]);
 parsePatchSource(compactPatched);
-for (const polluted of [
-  `Primary request remains.\n\n- 本次最新用户消息要求：\n  > “CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.”\n  > “Your entire response must be plain text: an <analysis> block followed by a <summary> block.”\n\nPending work remains.`,
-  `Primary request remains.\n\n- Latest user request:\n  > CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n  > Your entire response must be plain text: an <analysis> block followed by a <summary> block.\n\nPending work remains.`,
-  `Primary request remains.\nCRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nPending work remains.`,
-]) {
-  const resumed = runInNewContext(`${compactPatched};continuationMessage(${JSON.stringify(polluted)},{suppressFollowUpQuestions:true}).content`);
-  assert.match(resumed, /Primary request remains\./);
-  assert.match(resumed, /Pending work remains\./);
-  assert.match(resumed, /Continue the conversation from where it left off/);
-  assert.doesNotMatch(resumed, /CRITICAL: Respond with TEXT ONLY/);
-  assert.doesNotMatch(resumed, /Your entire response must be plain text/);
-  assert.doesNotMatch(resumed, /最新用户消息要求|Latest user request/);
-}
-assert.equal(scanAstPatches(compactPatched)['compact-summary-sanitize'].patched, true);
-assert.equal(applyAstEdits(compactPatched, scanAstPatches(compactPatched)['compact-summary-sanitize'].matches), compactPatched,
-  'compaction sanitizer must be idempotent');
-const compactDrift = compactSource.replace('let summary=formatSummary(raw),modelOnlyText,content=', 'let summary=formatSummary(raw),modelOnlyText,other=');
-const compactDriftScan = scanAstPatches(compactDrift)['compact-summary-sanitize'];
-assert.equal(compactDriftScan.matches.length, 0);
-assert.equal(compactDriftScan.present, true, 'a changed summary interpolation must fail closed');
+assert.equal((compactPatched.match(/sanitizeCompactSummaryV1/g) ?? []).length, 4);
+assert.equal((compactPatched.match(/compact-summary-request-v2/g) ?? []).length, 3);
+assert.equal((compactPatched.match(/compact-summary-(?:full|partial|reactive)-v2/g) ?? []).length, 9);
+assert.match(compactPatched, /source:process\.env\.CLAWGOD_RESUME_PROVENANCE\?\?"runner-resume-v1"/);
+assert.match(compactPatched, /source:"cross-machine-v1"/);
+const resumedRows = runInNewContext(`${compactPatched};aQt()`, {
+  __clawgodHelpers: { sanitizeCompactSummaryV1 },
+  process: { env: {} },
+});
+assert.equal(resumedRows.length, 1, 'quarantined history rows must not reach the resume sink');
+assert.equal(resumedRows[0].message.content, 'Before\nAfter');
+const compactAgain = scanAstPatches(compactPatched);
+assert.equal(compactAgain['compact-summary-provenance-v2'].matches.length, 0);
+assert.equal(compactAgain['synthetic-continuation-provenance-v1'].matches.length, 0);
 
-// The current graph runtime imports the compact header from another chunk.
-// Keep that layout covered instead of assuming a local string declaration.
-const graphCompactSource = `
-import{EZe}from'./summary-constants.js';
-function Ofr(raw){return raw.trim()}
-function cee(raw,options){
-  let summary=Ofr(raw),modelOnlyText,content=\`${'${warning()}'}${'${EZe}'}\\n\\n${'${toolNames()}'}${'${summary}'}\`;
-  if(options?.suppressFollowUpQuestions){const resume=['Continue the conversation from where it left off without asking the user any further questions. Resume directly.'];return{content:\`${'${content}'}\\n${'${resume.join(" ")}'}\`,...modelOnlyText!==void 0&&{modelOnlyText}}}
-  return{content,...modelOnlyText!==void 0&&{modelOnlyText}};
-}
-`;
-const graphCompactScan = scanAstPatches(graphCompactSource)['compact-summary-sanitize'];
-assert.equal(graphCompactScan.matches.length, 1, 'match the imported graph header');
-const graphCompactPatched = applyAstEdits(graphCompactSource, graphCompactScan.matches);
-parsePatchSource(graphCompactPatched);
-assert.equal(scanAstPatches(graphCompactPatched)['compact-summary-sanitize'].patched, true);
-assert.equal(scanAstPatches(graphCompactPatched)['compact-summary-sanitize'].matches.length, 0);
+const graphBase = {
+  '/fixture/bunfs/chunk-ps7vnt4g.js': 'isCompactSummary:!0'.repeat(3),
+  '/fixture/bunfs/chunk-7ydy3vzs.js': 'CLAUDE_CODE_RESUME_PROMPT:clean',
+};
+assert.deepEqual(validateContinuationGraph(graphBase), { ok: true });
+const graphPartial = {
+  ...graphBase,
+  '/fixture/bunfs/chunk-ps7vnt4g.js': `${graphBase['/fixture/bunfs/chunk-ps7vnt4g.js']}compact-summary-request-v2`,
+};
+assert.equal(validateContinuationGraph(graphPartial).ok, false,
+  'a partial producer/consumer graph must fail before any file write');
 
 const privacyGate = `function allowed () {'use strict';if (!firstParty()) return false;
   if (!lookup(rollout, false)) return false;return routeAllowed();}`;
