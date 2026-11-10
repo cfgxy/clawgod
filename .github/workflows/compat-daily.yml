@@ -53,6 +53,9 @@ jobs:
       - name: Run AST patch regression tests
         run: node src/shared/ast-patches.test.mjs
 
+      - name: Run compact summary provenance tests
+        run: node src/shared/compact-summary.test.mjs
+
       - name: Run patch semantic tests
         run: node src/shared/patch.test.mjs
 

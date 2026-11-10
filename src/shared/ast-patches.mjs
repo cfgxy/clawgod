@@ -3,16 +3,20 @@ import { parse } from './acorn.mjs';
 export const AST_PATCH_IDS = [
   'user-type-ant', 'bun-standalone-executable', 'growthbook-env-overrides-graph',
   'computer-use-default', 'ultraplan', 'voice-mode',
-  'geo-stego-date', 'remote-settings-off', 'wiggly-dove', 'compact-summary-sanitize',
+  'geo-stego-date', 'remote-settings-off', 'wiggly-dove',
+  'compact-summary-provenance-v2', 'synthetic-continuation-provenance-v1',
 ];
 
 const COMPACT_HEADER = 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.';
 const COMPACT_CONTINUATION = 'Continue the conversation from where it left off without asking the user any further questions.';
 const COMPACT_INTERNAL_MARKER = 'CRITICAL: Respond with TEXT ONLY';
+const COMPACT_REQUEST_MARKER = 'compact-summary-request-v2';
+const COMPACT_HELPER_MARKER = 'sanitizeCompactSummaryV1';
+const SYNTHETIC_PROVENANCE_MARKER = 'synthetic-continuation-provenance-v1';
 const anchors = ['external', 'isStandaloneExecutable', 'environmentOverridesParsed',
   'pixelValidation', 'ultraplan', 'tengu_amber_quartz_disabled', 's date is ',
   'Remote settings:', 'remote-settings.json', 'tengu_wiggly_dove',
-  COMPACT_HEADER, COMPACT_CONTINUATION];
+  COMPACT_HEADER, COMPACT_CONTINUATION, 'CLAUDE_CODE_RESUME_PROMPT', 'FHr'];
 const gate = id => `globalThis.__clawgodPatches?.[${JSON.stringify(id)}]!==!1`;
 const literal = (node, value) => node?.type === 'Literal' && node.value === value;
 const propertyName = node => node.computed
@@ -28,10 +32,74 @@ const isUndefined = node => node?.type === 'UnaryExpression' && node.operator ==
 const stringValues = node => node?.type === 'Literal' && typeof node.value === 'string' ? [node.value]
   : node?.type === 'TemplateLiteral' ? node.quasis.map(quasi => quasi.value.cooked ?? '') : [];
 
+const isFunction = node => ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']
+  .includes(node?.type);
+const directCall = (node, name) => node?.type === 'CallExpression' &&
+  node.callee?.type === 'Identifier' && node.callee.name === name;
+const objectProperty = (object, name) => object?.type === 'ObjectExpression' &&
+  object.properties.find(property => property.type === 'Property' && propertyName(property) === name);
+const objectHasProperty = (object, name) => Boolean(objectProperty(object, name));
+
+function nestedCall(root, name) {
+  let found;
+  walk(root, node => {
+    if (!found && directCall(node, name)) found = node;
+  });
+  return found;
+}
+
+function appendObjectProperties(code, object, properties) {
+  const original = code.slice(object.start, object.end);
+  return `${original.slice(0, -1)}${original.length > 2 ? ',' : ''}${properties}}`;
+}
+
+function compactSanitizerExpression(code, call, source) {
+  return `globalThis.__clawgodHelpers.${COMPACT_HELPER_MARKER}(${code.slice(call.start, call.end)},` +
+    `{kind:"auto-continuation",version:2,source:${JSON.stringify(source)}}).text`;
+}
+
+function syntheticMetadata(code, object, source, sourceExpression = JSON.stringify(source)) {
+  return appendObjectProperties(code, object,
+    `promptSource:"system",origin:{kind:"auto-continuation",version:1,source:${sourceExpression}}`);
+}
+
 export const parsePatchSource = code => parse(code, {
   ecmaVersion: 'latest', sourceType: 'script', allowHashBang: true,
   allowReturnOutsideFunction: true, allowImportExportEverywhere: true,
 });
+
+export function validateContinuationGraph(files) {
+  const entries = Object.entries(files);
+  const compact = entries.find(([name]) => name.endsWith('/bunfs/chunk-ps7vnt4g.js'))?.[1];
+  const runner = entries.find(([name]) => name.endsWith('/bunfs/chunk-7ydy3vzs.js'))?.[1];
+  if (compact === undefined && runner === undefined) return { ok: true, skipped: true };
+  if (compact === undefined || runner === undefined) {
+    return { ok: false, reason: 'continuation graph is missing a required producer or consumer chunk' };
+  }
+
+  const count = (source, needle) => source.split(needle).length - 1;
+  const states = [
+    ['compact request provenance', count(compact, COMPACT_REQUEST_MARKER), 3],
+    ['compact sanitizer calls', count(compact, COMPACT_HELPER_MARKER), 4],
+    ['compact result provenance',
+      ['compact-summary-full-v2', 'compact-summary-partial-v2', 'compact-summary-reactive-v2']
+        .reduce((total, marker) => total + count(compact, marker), 0), 9],
+    ['synthetic consumer provenance',
+      count(compact, 'CLAWGOD_RESUME_PROVENANCE') + count(compact, 'cross-machine-v1'), 2],
+    ['runner provenance', count(runner, 'CLAWGOD_RESUME_PROVENANCE'), 1],
+  ];
+  const allClean = states.every(([, actual]) => actual === 0);
+  const allPatched = states.every(([, actual, expected]) => actual === expected);
+  const errors = [];
+  if (count(compact, 'isCompactSummary:!0') !== 3) {
+    errors.push(`compact result rows: expected 3, got ${count(compact, 'isCompactSummary:!0')}`);
+  }
+  if (!allClean && !allPatched) {
+    errors.push(`continuation provenance is partial: ${states
+      .map(([label, actual, expected]) => `${label}=${actual}/${expected}`).join(', ')}`);
+  }
+  return errors.length === 0 ? { ok: true } : { ok: false, reason: errors.join('; ') };
+}
 
 // Iterative traversal avoids adding a second call stack limit to large bundles.
 function walk(root, visit) {
@@ -256,81 +324,156 @@ export function scanAstPatches(code) {
       }
     }
 
-    if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type) &&
-        node.params.length >= 1 && node.params[0].type === 'Identifier' && node.body?.type === 'BlockStatement') {
-      const id = 'compact-summary-sanitize';
-      const strings = [];
-      const templates = [];
-      walk(node.body, child => {
-        strings.push(...stringValues(child));
-        if (child.type === 'TemplateLiteral') templates.push(child);
-      });
-      const isContinuationBuilder = strings.some(value => value.includes(COMPACT_CONTINUATION));
-      if (!isContinuationBuilder) return;
+    if (node.type === 'FunctionDeclaration' && node.id?.type === 'Identifier' &&
+        node.body?.type === 'BlockStatement') {
+      const compactId = 'compact-summary-provenance-v2';
+      const syntheticId = 'synthetic-continuation-provenance-v1';
+      const functionName = node.id.name;
 
-      const contentBindings = new Set();
-      walk(node.body, child => {
-        if (child.type !== 'ObjectExpression') return;
-        for (const property of child.properties) {
-          if (property.type === 'Property' && propertyName(property) === 'content' &&
-              property.value.type === 'Identifier') contentBindings.add(property.value.name);
-        }
-      });
-      const templateBindings = new Map(node.body.body.filter(statement =>
-        statement.type === 'VariableDeclaration').flatMap(statement => statement.declarations)
-        .filter(declaration => declaration.id.type === 'Identifier' &&
-          declaration.init?.type === 'TemplateLiteral').map(declaration =>
-          [declaration.init.start, declaration.id.name]));
-      const headerTemplates = templates.filter(template => {
-        if (!contentBindings.has(templateBindings.get(template.start))) return false;
-        const localHeader = template.expressions.some(expression =>
-          expression.type === 'Identifier' && compactHeaderBindings.has(expression.name));
-        // The graph bundle imports the header from a sibling chunk. Its message
-        // body ends with the summarized input and has a distinct header binding.
-        const importedHeader = template.expressions.at(-1)?.type === 'Identifier' &&
-          template.quasis.at(-1)?.value.cooked === '' &&
-          template.quasis.some(quasi => quasi.value.cooked?.includes('\n\n')) &&
-          template.expressions.slice(0, -1).some(expression => expression.type === 'Identifier');
-        return localHeader || importedHeader;
-      });
-      if (headerTemplates.length !== 1) {
-        results[id].present = true;
-        return;
-      }
-
-      const summaryReferences = new Set(headerTemplates[0].expressions
-        .filter(expression => expression.type === 'Identifier').map(expression => expression.name));
-      const isSummaryExpression = expression => {
-        const inputCalls = [];
-        walk(expression, child => {
-          if (child.type === 'CallExpression' && child.callee.type === 'Identifier' &&
-              child.arguments.length === 1 && child.arguments[0].type === 'Identifier' &&
-              child.arguments[0].name === node.params[0].name) inputCalls.push(child);
+      if (['_Nr', 'yWs', 'Ken'].includes(functionName)) {
+        const calls = [];
+        walk(node.body, child => {
+          if (directCall(child, 'Ie') && child.arguments[0]?.type === 'ObjectExpression') {
+            calls.push(child);
+          }
         });
-        return inputCalls.length === 1;
-      };
-      const summaries = node.body.body.filter(statement => statement.type === 'VariableDeclaration')
-        .flatMap(statement => statement.declarations).filter(declaration =>
-          declaration.id.type === 'Identifier' && summaryReferences.has(declaration.id.name) &&
-          declaration.init && isSummaryExpression(declaration.init));
-      if (summaries.length !== 1) {
-        results[id].present = true;
-        return;
+        const requests = calls.filter(call => {
+          const object = call.arguments[0];
+          return objectProperty(object, 'content') &&
+            !objectHasProperty(object, 'isCompactSummary') &&
+            !object.properties.some(property => property.type === 'SpreadElement');
+        });
+        const resultCalls = calls.filter(call => {
+          const object = call.arguments[0];
+          return objectHasProperty(object, 'isCompactSummary') &&
+            object.properties.some(property => property.type === 'SpreadElement' &&
+              nestedCall(property.argument, '$J'));
+        });
+        if (requests.length === 1) {
+          const requestSource = code.slice(requests[0].start, requests[0].end);
+          if (requestSource.includes(COMPACT_REQUEST_MARKER)) results[compactId].patched = true;
+          else {
+            results[compactId].present = true;
+            edit(compactId, requests[0].arguments[0], appendObjectProperties(code,
+              requests[0].arguments[0],
+              `isMeta:!0,promptSource:"system",origin:{kind:"auto-continuation",version:2,source:"${COMPACT_REQUEST_MARKER}"}`));
+          }
+        } else {
+          results[compactId].present = true;
+        }
+
+        const sourceKind = functionName === '_Nr' ? 'full' : functionName === 'yWs' ? 'partial' : 'reactive';
+        if (resultCalls.length === 1) {
+          const resultObject = resultCalls[0].arguments[0];
+          const spread = resultObject.properties.find(property => property.type === 'SpreadElement' &&
+            nestedCall(property.argument, '$J'));
+          const summaryCall = spread && nestedCall(spread.argument, '$J');
+          const summarySource = spread ? code.slice(spread.argument.start, spread.argument.end) : '';
+          const resultSource = `compact-summary-${sourceKind}-v2`;
+          const resultObjectSource = code.slice(resultObject.start, resultObject.end);
+          const compactFlag = objectProperty(resultObject, 'isCompactSummary');
+          if (!spread || !summaryCall) {
+            results[compactId].present = true;
+          } else {
+            let changed = false;
+            if (!summarySource.includes(COMPACT_HELPER_MARKER)) {
+              results[compactId].present = true;
+              edit(compactId, spread.argument, compactSanitizerExpression(code, summaryCall, resultSource));
+              changed = true;
+            }
+            if (!resultObjectSource.includes(resultSource)) {
+              if (!compactFlag) {
+                results[compactId].present = true;
+              } else {
+                results[compactId].present = true;
+                edit(compactId, compactFlag,
+                  `${code.slice(compactFlag.start, compactFlag.end)},promptSource:"system",origin:{kind:"auto-continuation",version:2,source:"${resultSource}"}`);
+                changed = true;
+              }
+            }
+            if (!changed && summarySource.includes(COMPACT_HELPER_MARKER) &&
+                resultObjectSource.includes(resultSource)) results[compactId].patched = true;
+          }
+        } else {
+          results[compactId].present = true;
+        }
       }
-      const summary = summaries[0];
-      const summarySource = code.slice(summary.init.start, summary.init.end);
-      const existingSanitizer = summary.init.type === 'CallExpression' &&
-        member(summary.init.callee, 'trim') &&
-        summarySource.includes(COMPACT_INTERNAL_MARKER);
-      if (existingSanitizer) {
-        results[id].patched = true;
-        return;
+
+      if (functionName === 'Uen' || functionName === 'NJ') {
+        const returns = [];
+        walk(node.body, child => {
+          if (child.type === 'ReturnStatement' && child.argument &&
+              code.slice(child.argument.start, child.argument.end).includes('Ben(')) returns.push(child);
+        });
+        if (returns.length === 1) {
+          const original = code.slice(returns[0].argument.start, returns[0].argument.end);
+          if (original.includes('clawgod-compact-request')) {
+            results[compactId].patched = true;
+          } else {
+            results[compactId].present = true;
+            const open = '<clawgod-compact-request version="2" tool-policy="deny">\n';
+            const close = '\n</clawgod-compact-request>';
+            edit(compactId, returns[0].argument,
+              `${JSON.stringify(open)}+(${original})+${JSON.stringify(close)}`);
+          }
+        }
       }
-      const original = code.slice(summary.init.start, summary.init.end);
-      // The compactor's own no-tools prompt is valid only while creating the
-      // summary. Drop quoted copies before the summary becomes a user message.
-      const sanitize = `(${original}).replace(/(?:^|\\n)[^\\n]*(?:(?:(?:latest|most recent)\\s+)?user\\s+(?:message|request)|(?:本次)?最新?用户(?:消息|要求))[^\\n]*\\n\\s*(?:>\\s*)?["“”]?\\s*CRITICAL: Respond with TEXT ONLY\\. Do NOT call any tools\\.\\s*["“”]?(?:\\n\\s*(?:>\\s*)?["“”]?\\s*Your entire response must be plain text:[^\\n]*["“”]?)?/giu,"").replace(/(?:^|\\n)[^\\n]*CRITICAL: Respond with TEXT ONLY\\. Do NOT call any tools\\.[^\\n]*(?:\\n\\s*(?:>\\s*)?["“”]?\\s*Your entire response must be plain text:[^\\n]*["“”]?)?/gu,"").replace(/(?:^|\\n)\\s*(?:>\\s*)?["“”]?\\s*Your entire response must be plain text:[^\\n]*/gu,"").replace(/\\n{3,}/g,"\\n\\n").trim()`;
-      edit(id, summary.init, sanitize);
+
+      if (functionName === 'aQt') {
+        const compactRows = [];
+        const resumeRows = [];
+        walk(node.body, child => {
+          if (child.type === 'VariableDeclaration' && child.declarations.length === 1) {
+            const declaration = child.declarations[0];
+            if (declaration.id.type === 'Identifier' && declaration.id.name === 'Qe' &&
+                directCall(declaration.init, 'aHe')) compactRows.push(child);
+          }
+          if (directCall(child, 'Ie') && child.arguments[0]?.type === 'ObjectExpression') {
+            const object = child.arguments[0];
+            const content = objectProperty(object, 'content')?.value;
+            if (directCall(content, 'FHr') && objectHasProperty(object, 'isMeta')) resumeRows.push(object);
+          }
+        });
+        if (compactRows.length === 1) {
+          if (code.slice(node.start, node.end).includes('__clawgodCompactResumeV2')) {
+            results[compactId].patched = true;
+          } else {
+            results[compactId].present = true;
+            const original = code.slice(compactRows[0].start, compactRows[0].end);
+            const injection = `;globalThis.__clawgodCompactResumeV2=!0;Qe=Qe.map(_clawgodRow=>{if(_clawgodRow?.type!=="user"||_clawgodRow.isCompactSummary!==!0)return _clawgodRow;const _clawgodOrigin=_clawgodRow.origin;if(_clawgodOrigin!==void 0&&(_clawgodOrigin.kind!=="auto-continuation"||![1,2].includes(_clawgodOrigin.version)||!["compact-summary-full-v2","compact-summary-partial-v2","compact-summary-reactive-v2","compact-summary-resume-v2"].includes(_clawgodOrigin.source))){globalThis.__clawgodResumeQuarantine=!0;return null}const _clawgodProvenance=_clawgodOrigin??{kind:"auto-continuation",version:1,source:"compact-summary-resume-v2"};const _clawgodSanitized=globalThis.__clawgodHelpers.${COMPACT_HELPER_MARKER}(_clawgodRow.message?.content,_clawgodProvenance);if(_clawgodSanitized.disposition==="quarantine"){globalThis.__clawgodResumeQuarantine=!0;return null}if(_clawgodSanitized.disposition!=="sanitized")return _clawgodRow;return{..._clawgodRow,message:{..._clawgodRow.message,content:_clawgodSanitized.text},origin:_clawgodOrigin??{kind:"auto-continuation",version:1,source:"compact-summary-resume-v2"}}}).filter(_clawgodRow=>_clawgodRow!==null);`;
+            edit(compactId, compactRows[0], original + injection);
+          }
+        }
+        for (const object of resumeRows) {
+          const original = code.slice(object.start, object.end);
+          if (original.includes(SYNTHETIC_PROVENANCE_MARKER) ||
+              original.includes('CLAWGOD_RESUME_PROVENANCE')) results[syntheticId].patched = true;
+          else {
+            results[syntheticId].present = true;
+            edit(syntheticId, object, syntheticMetadata(code, object, SYNTHETIC_PROVENANCE_MARKER,
+              'process.env.CLAWGOD_RESUME_PROVENANCE??"runner-resume-v1"'));
+          }
+        }
+      }
+
+      if (functionName === 'e7o') {
+        const calls = [];
+        walk(node.body, child => {
+          if (directCall(child, 'Ie') && child.arguments[0]?.type === 'ObjectExpression') calls.push(child);
+        });
+        for (const call of calls) {
+          const object = call.arguments[0];
+          if (!objectProperty(object, 'content') || !objectHasProperty(object, 'isMeta')) continue;
+          const original = code.slice(object.start, object.end);
+          if (original.includes(SYNTHETIC_PROVENANCE_MARKER) || original.includes('cross-machine-v1')) {
+            results[syntheticId].patched = true;
+          } else {
+            results[syntheticId].present = true;
+            edit(syntheticId, object, syntheticMetadata(code, object, SYNTHETIC_PROVENANCE_MARKER,
+              '"cross-machine-v1"'));
+          }
+        }
+      }
     }
   });
   if ([...wigglyLiterals].some(start => !wigglyHandled.has(start))) {

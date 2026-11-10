@@ -5,7 +5,13 @@
 import { readFileSync, writeFileSync, existsSync, copyFileSync, readdirSync, renameSync } from 'fs';
 import { join, dirname, relative } from 'path';
 import { fileURLToPath } from 'url';
-import { AST_PATCH_IDS, scanAstPatches, applyAstEdits, parsePatchSource } from './ast-patches.mjs';
+import {
+  AST_PATCH_IDS,
+  scanAstPatches,
+  applyAstEdits,
+  parsePatchSource,
+  validateContinuationGraph,
+} from './ast-patches.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TARGET = join(__dirname, 'cli.original.cjs');
@@ -753,14 +759,32 @@ const patches = [
     ast: true,
   },
   {
-    // Claude Code replays compaction output as a synthetic user message. The
-    // compactor-only no-tools preamble must never survive that boundary: model
-    // summaries have incorrectly restated it as the latest user instruction.
-    // The AST matcher anchors the continuation header, its resume guidance and
-    // the formatted-summary interpolation, then sanitizes only that value.
-    id: 'compact-summary-sanitize',
-    name: 'Remove compactor-only no-tools instructions from resumed summaries',
+    // Mark the compactor request as internal and version its wrapper. The AST
+    // matcher also sanitizes the three full/partial/reactive summary outputs
+    // and re-checks persisted summary rows during resume.
+    id: 'compact-summary-provenance-v2',
+    name: 'Version compact summaries and preserve their provenance',
     ast: true,
+  },
+  {
+    // Synthetic rows from interrupted turns and cross-machine resumes are not
+    // user messages. Keep their source explicit instead of inferring it from
+    // the text later in the conversation.
+    id: 'synthetic-continuation-provenance-v1',
+    name: 'Mark synthetic continuation provenance',
+    ast: true,
+  },
+  {
+    id: 'synthetic-continuation-producer-v1',
+    name: 'Carry runner resume provenance into the child environment',
+    pattern: /(CLAUDE_CODE_RESUME_PROMPT:kn\?SBs:\(Lt\?\?0\)>1\?bBs:void 0,(?!CLAWGOD_RESUME_PROVENANCE))/g,
+    replacer: (m) => `${m}CLAWGOD_RESUME_PROVENANCE:kn?"runner-resume-v1":(Lt??0)>1?"runner-restart-v1":void 0,`,
+    unique: true,
+    strictUniqueInGraph: true,
+    requiredInGraph: true,
+    optional: true,
+    sentinel: 'CLAWGOD_RESUME_PROVENANCE',
+    sentinelFiles: ['bunfs/chunk-7ydy3vzs.js'],
   },
 ];
 
@@ -914,6 +938,12 @@ if (revert) {
   process.exit(0);
 }
 
+const continuationGraph = validateContinuationGraph(files);
+if (!continuationGraph.ok) {
+  console.error(`Continuation graph preflight failed: ${continuationGraph.reason}. Source files were not changed.`);
+  process.exit(1);
+}
+
 console.log(`\n${'═'.repeat(55)}`);
 console.log(`  ClawGod (universal)`);
 console.log(`  Target: cli.original.cjs (v${version}) ${isGraph ? `[graph: ${Object.keys(files).length} files]` : ''}`);
@@ -998,6 +1028,23 @@ for (const p of [...patches.filter(p => p.ast), ...patches.filter(p => !p.ast)])
       applied++;
       continue;
     }
+    if (p.sentinel !== undefined) {
+      const sentinels = Array.isArray(p.sentinel) ? p.sentinel : [p.sentinel];
+      const sentinelEntries = p.sentinelFiles
+        ? Object.entries(files).filter(([name]) => p.sentinelFiles.some((suffix) => name.endsWith(suffix)))
+        : Object.entries(files);
+      const stillPresent = sentinels.filter((s) => sentinelEntries.some(([, c]) => c.includes(s)));
+      if (stillPresent.length > 0) {
+        console.log(`  ✅ ${p.name} (already applied, sentinel present)`);
+        applied++;
+        continue;
+      }
+    }
+    if (p.requiredInGraph && isGraph && !continuationGraph.skipped) {
+      console.log(`  ❌ ${p.name} — required continuation producer not found in graph`);
+      failed++;
+      continue;
+    }
     if (p.optional) {
       console.log(`  ⏭  ${p.name} (not present in this version)`);
       skipped++;
@@ -1024,6 +1071,12 @@ for (const p of [...patches.filter(p => p.ast), ...patches.filter(p => !p.ast)])
     }
     console.log(`  ⚠️  ${p.name} (0 matches, no sentinel — cannot verify)`);
     skipped++;
+    continue;
+  }
+
+  if (p.strictUniqueInGraph && isGraph && totalMatches !== 1) {
+    console.log(`  ❌ ${p.name} — expected exactly one graph match, got ${totalMatches}`);
+    failed++;
     continue;
   }
 
